@@ -2,6 +2,9 @@
 
 An open-source, local-first, Descript-like text-based video editor powered by AI. Edit video by editing text — delete a word from the transcript and it's cut from the video.
 
+<img width="1034" height="661" alt="image" src="https://github.com/user-attachments/assets/b1ed9505-792e-42ca-bb73-85458d0f02a5" />
+
+
 ## Architecture
 
 - **Electron + React** desktop app with Tailwind CSS
