@@ -187,10 +187,24 @@ export const useEditorStore = create<EditorState & EditorActions>()(
         }
 
         // Pad first segment start and last segment end by 1.5s to preserve
-        // the silent intro and outro (music before first word / after last word)
+        // the silent intro and outro (music before first word / after last word),
+        // but clamp against adjacent deleted ranges so the padding never bleeds
+        // into content the user explicitly cut.
         if (segments.length > 0) {
-          segments[0].start = Math.max(0, segments[0].start - 1.5);
-          segments[segments.length - 1].end = Math.min(duration, segments[segments.length - 1].end + 1.5);
+          const firstSeg = segments[0];
+          const lastSeg = segments[segments.length - 1];
+
+          // Furthest end-time of any deleted range that sits before the first keep segment
+          const prevDeletedEnd = deletedRanges
+            .filter((r) => r.end <= firstSeg.start)
+            .reduce((max, r) => Math.max(max, r.end), 0);
+          firstSeg.start = Math.max(prevDeletedEnd, firstSeg.start - 1.5);
+
+          // Nearest start-time of any deleted range that sits after the last keep segment
+          const nextDeletedStart = deletedRanges
+            .filter((r) => r.start >= lastSeg.end)
+            .reduce((min, r) => Math.min(min, r.start), duration);
+          lastSeg.end = Math.min(nextDeletedStart, lastSeg.end + 1.5);
         }
 
         return segments;
