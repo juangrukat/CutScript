@@ -13,7 +13,13 @@ from typing import Optional
 import torch
 
 
-def _make_cache_op(beam_size: int, vad_filter: bool, vad_min_silence_ms: int) -> str:
+_VERBATIM_PROMPT = (
+    "Verbatim transcript. Preserve all repeated words, stutters, false starts, "
+    "and filler sounds exactly as spoken."
+)
+
+
+def _make_cache_op(beam_size: int, vad_filter: bool, vad_min_silence_ms: int, verbatim: bool) -> str:
     """
     Build a cache-op string that encodes all variable transcription settings.
     Different combinations produce different hashes so cached results are never
@@ -25,9 +31,11 @@ def _make_cache_op(beam_size: int, vad_filter: bool, vad_min_silence_ms: int) ->
         "beam_size": beam_size,
         "vad_filter": vad_filter,
         "vad_min_silence_ms": vad_min_silence_ms if vad_filter else 0,
-        # Noise-suppression thresholds are disabled when VAD handles segmentation
-        "no_speech_threshold": None if vad_filter else 0.8,
-        "compression_ratio_threshold": None if vad_filter else 1.8,
+        "verbatim": verbatim,
+        # In verbatim mode, thresholds are relaxed to avoid rejecting real repetitions.
+        # With VAD, both thresholds are disabled — VAD owns segmentation decisions.
+        "no_speech_threshold": None if vad_filter else (0.6 if verbatim else 0.8),
+        "compression_ratio_threshold": None if vad_filter else (2.4 if verbatim else 1.8),
     }
     return "transcribe_wx_" + hashlib.md5(
         json.dumps(settings, sort_keys=True).encode()
@@ -145,6 +153,7 @@ def transcribe_audio(
     beam_size: int = 5,
     vad_filter: bool = False,
     vad_min_silence_ms: int = 500,
+    verbatim: bool = False,
     progress_cb=None,
 ) -> dict:
     """
@@ -154,7 +163,14 @@ def transcribe_audio(
         dict with keys: words, segments, language
     """
     file_path = Path(file_path)
-    cache_op = _make_cache_op(beam_size, vad_filter, vad_min_silence_ms)
+    cache_op = _make_cache_op(beam_size, vad_filter, vad_min_silence_ms, verbatim)
+
+    # In verbatim mode, prepend the verbatim instruction so Whisper preserves
+    # repetitions, stutters, and false starts instead of smoothing them out.
+    if verbatim:
+        initial_prompt = (
+            _VERBATIM_PROMPT + (" " + initial_prompt if initial_prompt else "")
+        )
 
     if use_cache:
         cached = load_from_cache(file_path, model_name, cache_op)
@@ -186,7 +202,7 @@ def transcribe_audio(
         result = _transcribe_whisperx(
             model, str(preprocessed_path), actual_device, language, initial_prompt,
             beam_size=beam_size, vad_filter=vad_filter, vad_min_silence_ms=vad_min_silence_ms,
-            progress_cb=progress_cb,
+            verbatim=verbatim, progress_cb=progress_cb,
         )
     else:
         if progress_cb:
@@ -252,6 +268,7 @@ def _transcribe_whisperx(
     beam_size: int = 5,
     vad_filter: bool = False,
     vad_min_silence_ms: int = 500,
+    verbatim: bool = False,
     progress_cb=None,
 ) -> dict:
     def _p(pct: int, status: str):
@@ -277,10 +294,19 @@ def _transcribe_whisperx(
         transcribe_opts["vad_parameters"] = {"min_silence_duration_ms": vad_min_silence_ms}
     else:
         transcribe_opts["vad_filter"] = False
-        # Suppress segments where the model has low confidence there is speech.
-        transcribe_opts["no_speech_threshold"] = 0.8
-        # Reject output whose compression ratio signals repeated or looping text.
-        transcribe_opts["compression_ratio_threshold"] = 1.8
+        if verbatim:
+            # Verbatim mode: relax thresholds so that real repeated speech and
+            # borderline speech regions are not filtered out.
+            # no_speech_threshold 0.8 → 0.6: less likely to skip uncertain regions.
+            # compression_ratio_threshold 1.8 → 2.4 (the faster-whisper default):
+            #   avoids rejecting genuine repetitions as hallucinated looping.
+            transcribe_opts["no_speech_threshold"] = 0.6
+            transcribe_opts["compression_ratio_threshold"] = 2.4
+        else:
+            # Suppress segments where the model has low confidence there is speech.
+            transcribe_opts["no_speech_threshold"] = 0.8
+            # Reject output whose compression ratio signals repeated or looping text.
+            transcribe_opts["compression_ratio_threshold"] = 1.8
 
     if language:
         transcribe_opts["language"] = language
@@ -310,7 +336,11 @@ def _transcribe_whisperx(
         pct = 10 + int(min(seg.end, total_duration) / total_duration * 60)
         _p(min(pct, 70), "Transcribing...")
 
-    segments_for_align = _deduplicate_segments(segments_for_align)
+    # In verbatim mode, skip deduplication — the filter removes consecutive
+    # identical segments to suppress hallucination loops, but in verbatim mode
+    # a speaker genuinely repeating a phrase looks identical to a loop artifact.
+    if not verbatim:
+        segments_for_align = _deduplicate_segments(segments_for_align)
 
     _p(72, "Aligning words...")
     try:
@@ -328,7 +358,10 @@ def _transcribe_whisperx(
             return_char_alignments=False,
         )
         _p(95, "Finalizing...")
-        aligned_segments = _deduplicate_segments(aligned.get("segments", []))
+        aligned_segments = (
+            aligned.get("segments", []) if verbatim
+            else _deduplicate_segments(aligned.get("segments", []))
+        )
     except Exception as align_err:
         logger.warning(
             f"Word alignment failed for language '{detected_language}', "

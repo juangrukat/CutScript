@@ -33,6 +33,7 @@ class TranscribeRequest(BaseModel):
     beam_size: int = 5
     vad_filter: bool = False
     vad_min_silence_ms: int = 500
+    verbatim: bool = False
 
     @field_validator("model")
     @classmethod
@@ -69,6 +70,7 @@ async def transcribe(req: TranscribeRequest):
             beam_size=req.beam_size,
             vad_filter=req.vad_filter,
             vad_min_silence_ms=req.vad_min_silence_ms,
+            verbatim=req.verbatim,
         )
 
         if req.diarize and req.hf_token:
@@ -123,6 +125,7 @@ async def transcribe_stream(req: TranscribeRequest):
                 beam_size=req.beam_size,
                 vad_filter=req.vad_filter,
                 vad_min_silence_ms=req.vad_min_silence_ms,
+                verbatim=req.verbatim,
                 progress_cb=on_progress,
             )
 

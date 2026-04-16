@@ -55,6 +55,7 @@ export default function App() {
   const [beamSize, setBeamSize] = useState(() => parseInt(localStorage.getItem('txBeamSize') ?? '5'));
   const [vadFilter, setVadFilter] = useState(() => localStorage.getItem('txVadFilter') === 'true');
   const [vadMinSilenceMs, setVadMinSilenceMs] = useState(() => parseInt(localStorage.getItem('txVadMinSilenceMs') ?? '500'));
+  const [verbatim, setVerbatim] = useState(false);
   const [diarize, setDiarize] = useState(false);
   const [hfToken, setHfToken] = useState('');
   const [numSpeakers, setNumSpeakers] = useState('');
@@ -121,6 +122,7 @@ export default function App() {
           beam_size: beamSize,
           vad_filter: vadFilter,
           vad_min_silence_ms: vadMinSilenceMs,
+          verbatim,
           diarize,
           hf_token: diarize && hfToken ? hfToken : undefined,
           num_speakers: diarize && numSpeakers ? parseInt(numSpeakers) : undefined,
@@ -305,6 +307,24 @@ export default function App() {
                       <span className="text-xs text-editor-text-muted">ms</span>
                     </div>
                   )}
+                </div>
+
+                {/* Verbatim mode */}
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={verbatim}
+                      onChange={(e) => setVerbatim(e.target.checked)}
+                      className="mt-0.5 accent-editor-accent"
+                    />
+                    <span className="text-xs text-editor-text leading-snug">
+                      Verbatim mode
+                      <span className="block text-editor-text-muted mt-0.5">
+                        Preserves repeated words, stutters, false starts, and filler sounds. Off by default — Whisper normally smooths disfluencies for readability. Turn this on when exact spoken content matters.
+                      </span>
+                    </span>
+                  </label>
                 </div>
 
                 {/* Speaker diarization */}
