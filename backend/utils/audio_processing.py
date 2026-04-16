@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 import tempfile
 import os
 import logging
@@ -46,6 +47,35 @@ def cleanup_temp_audio():
             logger.warning(f"Could not remove temp file {fpath}: {e}")
     _temp_audio_files.clear()
     return cleaned
+
+
+def preprocess_audio_for_transcription(audio_path: Path) -> Path:
+    """
+    Whisper-optimized preprocessing: trim leading silence and normalize loudness.
+
+    Long leading silences are a documented cause of Whisper inaccuracy (the model
+    can drift into hallucination or wrong-language output before speech begins).
+    Loudnorm ensures the signal is in a range Whisper handles well regardless of
+    recording level.
+
+    Falls back to the raw audio path if FFmpeg preprocessing fails so transcription
+    is never blocked by a preprocessing error.
+    """
+    output_path = audio_path.parent / f"{audio_path.stem}_prep.wav"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(audio_path),
+        "-af", (
+            "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.1,"
+            "loudnorm=I=-16:LRA=11:TP=-1.5"
+        ),
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.warning(f"Transcription audio preprocessing failed, using raw audio: {result.stderr[-200:]}")
+        return audio_path
+    return output_path
 
 
 def get_video_duration(video_path: Path):

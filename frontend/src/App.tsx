@@ -38,6 +38,8 @@ export default function App() {
   const [activePanel, setActivePanel] = useState<Panel>(null);
   const [manualPath, setManualPath] = useState('');
   const [whisperModel, setWhisperModel] = useState('base');
+  const [vocabPrompt, setVocabPrompt] = useState('');
+  const [transcribeStatus, setTranscribeStatus] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useKeyboardShortcuts();
@@ -89,20 +91,59 @@ export default function App() {
 
   const transcribeVideo = async (path: string) => {
     setTranscribing(true, 0);
+    setTranscribeStatus('Starting...');
     try {
-      const res = await fetch(`${backendUrl}/transcribe`, {
+      const res = await fetch(`${backendUrl}/transcribe/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ file_path: path, model: whisperModel }),
+        body: JSON.stringify({
+          file_path: path,
+          model: whisperModel,
+          initial_prompt: vocabPrompt.trim() || undefined,
+        }),
       });
       if (!res.ok) throw new Error(`Transcription failed: ${res.statusText}`);
-      const data = await res.json();
-      setTranscription(data);
+      if (!res.body) throw new Error('No response body from server');
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        // SSE lines end with \n\n; split on \n and process complete data: lines
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === 'progress') {
+              setTranscribing(true, event.value);
+              setTranscribeStatus(event.status ?? '');
+            } else if (event.type === 'done') {
+              setTranscription(event.result);
+              setTranscribing(false, 100);
+              setTranscribeStatus('');
+              return;
+            } else if (event.type === 'error') {
+              throw new Error(event.message);
+            }
+          } catch {
+            // skip malformed events
+          }
+        }
+      }
     } catch (err) {
       console.error('Transcription error:', err);
       alert(`Transcription failed. Check the console for details.\n\n${err}`);
     } finally {
       setTranscribing(false);
+      setTranscribeStatus('');
     }
   };
 
@@ -120,20 +161,36 @@ export default function App() {
           </p>
         </div>
 
-        {/* Whisper model selector */}
-        <div className="flex items-center gap-3">
-          <label className="text-xs text-editor-text-muted whitespace-nowrap">Whisper model:</label>
-          <select
-            value={whisperModel}
-            onChange={(e) => setWhisperModel(e.target.value)}
-            className="px-3 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
-          >
-            <option value="tiny">tiny (~75 MB, fastest)</option>
-            <option value="base">base (~140 MB, fast)</option>
-            <option value="small">small (~460 MB, good)</option>
-            <option value="medium">medium (~1.5 GB, better)</option>
-            <option value="large">large (~2.9 GB, best)</option>
-          </select>
+        {/* Whisper model selector + vocabulary prompt */}
+        <div className="flex flex-col items-center gap-3 w-full max-w-sm">
+          <div className="flex items-center gap-3 w-full">
+            <label className="text-xs text-editor-text-muted whitespace-nowrap">Whisper model:</label>
+            <select
+              value={whisperModel}
+              onChange={(e) => setWhisperModel(e.target.value)}
+              className="flex-1 px-3 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
+            >
+              <option value="tiny">tiny (~75 MB, fastest)</option>
+              <option value="base">base (~140 MB, fast)</option>
+              <option value="small">small (~460 MB, good)</option>
+              <option value="medium">medium (~1.5 GB, better)</option>
+              <option value="large-v3">large-v3 (~3.1 GB, best, multilingual)</option>
+              <option value="distil-large-v3">distil-large-v3 (~1.6 GB, great + fast)</option>
+            </select>
+          </div>
+          <div className="flex flex-col gap-1 w-full">
+            <label className="text-xs text-editor-text-muted">
+              Vocabulary prompt{' '}
+              <span className="opacity-50">(optional — names, acronyms, technical terms)</span>
+            </label>
+            <textarea
+              value={vocabPrompt}
+              onChange={(e) => setVocabPrompt(e.target.value)}
+              placeholder="e.g. John Smith, Acme Corp, API, OAuth, QuickBooks"
+              rows={2}
+              className="w-full px-3 py-2 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text placeholder:text-editor-text-muted/40 focus:outline-none focus:border-editor-accent resize-none"
+            />
+          </div>
         </div>
 
         {IS_ELECTRON ? (
@@ -244,11 +301,20 @@ export default function App() {
             {/* Transcript */}
             <div className="w-1/2 border-l border-editor-border flex flex-col min-h-0">
               {isTranscribing ? (
-                <div className="flex-1 flex flex-col items-center justify-center gap-4">
+                <div className="flex-1 flex flex-col items-center justify-center gap-5 px-8">
                   <Loader2 className="w-8 h-8 text-editor-accent animate-spin" />
-                  <p className="text-sm text-editor-text-muted">
-                    Transcribing... {Math.round(transcriptionProgress)}%
-                  </p>
+                  <div className="w-full max-w-xs space-y-2">
+                    <div className="flex justify-between text-xs text-editor-text-muted">
+                      <span>{transcribeStatus || 'Working...'}</span>
+                      <span>{Math.round(transcriptionProgress)}%</span>
+                    </div>
+                    <div className="h-1.5 w-full bg-editor-surface rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-editor-accent rounded-full transition-all duration-300 ease-out"
+                        style={{ width: `${transcriptionProgress}%` }}
+                      />
+                    </div>
+                  </div>
                 </div>
               ) : words.length > 0 ? (
                 <TranscriptEditor />

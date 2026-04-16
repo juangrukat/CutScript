@@ -186,6 +186,13 @@ export const useEditorStore = create<EditorState & EditorActions>()(
           segments.push({ start: segStart, end: words[words.length - 1].end });
         }
 
+        // Pad first segment start and last segment end by 1.5s to preserve
+        // the silent intro and outro (music before first word / after last word)
+        if (segments.length > 0) {
+          segments[0].start = Math.max(0, segments[0].start - 1.5);
+          segments[segments.length - 1].end = Math.min(duration, segments[segments.length - 1].end + 1.5);
+        }
+
         return segments;
       },
 

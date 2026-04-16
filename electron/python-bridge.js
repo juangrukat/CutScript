@@ -24,7 +24,8 @@ class PythonBackend {
       ? path.join(__dirname, '..', 'backend')
       : path.join(process.resourcesPath, 'backend');
 
-    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const venvPython = '/Users/kat/.cutscript-venv/bin/python3.12';
+    const pythonCmd = venvPython;
 
     this.process = spawn(pythonCmd, [
       '-m', 'uvicorn', 'main:app',

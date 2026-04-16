@@ -87,12 +87,16 @@ cutscript/
 | Waveform timeline | Done |
 | FFmpeg stream-copy export | Done |
 | FFmpeg re-encode (up to 4K) | Done |
+| Seamless audio cuts (boundary fades + loudness normalization) | Done |
 | AI filler word removal | Done |
 | AI clip creation (Shorts) | Done |
 | Ollama + OpenAI + Claude | Done |
 | Word-level captions (SRT/VTT/ASS) | Done |
 | Caption burn-in on export | Done |
 | Studio Sound (DeepFilterNet) | Done |
+| Real-time transcription progress (SSE streaming) | Done |
+| Transcription audio preprocessing (silence trim + loudnorm) | Done |
+| Vocabulary prompt for domain-specific transcription accuracy | Done |
 | Keyboard shortcuts (J/K/L) | Done |
 | Speaker diarization | Done |
 | Virtualized transcript (react-virtuoso) | Done |
@@ -120,6 +124,7 @@ cutscript/
 |--------|----------|-------------|
 | GET | /health | Health check |
 | POST | /transcribe | Transcribe video with WhisperX |
+| POST | /transcribe/stream | Transcribe with real-time SSE progress |
 | POST | /export | Export edited video (stream copy or re-encode) |
 | POST | /ai/filler-removal | Detect filler words via LLM |
 | POST | /ai/create-clip | AI-suggested clips for shorts |
