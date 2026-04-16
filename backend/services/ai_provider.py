@@ -72,11 +72,13 @@ def _openai_complete(prompt: str, model: str, api_key: str, system_prompt: Optio
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-        )
+        # Reasoning models (o1, o3, o4-mini, etc.) only support the default temperature
+        is_reasoning_model = model.startswith(("o1", "o3", "o4"))
+        kwargs = {"model": model, "messages": messages}
+        if not is_reasoning_model:
+            kwargs["temperature"] = temperature
+
+        response = client.chat.completions.create(**kwargs)
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"OpenAI error: {e}")

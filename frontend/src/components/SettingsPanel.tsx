@@ -137,7 +137,7 @@ export default function SettingsPanel() {
           label="Model"
           value={providers.claude.model}
           onChange={(v) => setProviderConfig('claude', { model: v })}
-          placeholder="claude-sonnet-4-20250514"
+          placeholder="claude-sonnet-4-6"
         />
       </ProviderSection>
     </div>

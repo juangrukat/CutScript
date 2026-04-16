@@ -3,6 +3,7 @@
 import logging
 import tempfile
 import os
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 from services.video_editor import export_stream_copy, export_reencode, export_reencode_with_subs
 from services.audio_cleaner import clean_audio
 from services.caption_generator import generate_srt, generate_ass, save_captions
+from utils.audio_processing import extract_audio
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -87,6 +89,17 @@ async def export_video(req: ExportRequest):
             tmp.close()
             ass_path = tmp.name
 
+        # Extract PCM WAV for sample-accurate audio cuts.
+        # The original MP4's AAC audio has 1024-sample (~23ms) frame boundaries
+        # which cause audible bleed at cut points. PCM WAV has no such constraints.
+        audio_wav_path = None
+        if not use_stream_copy:
+            try:
+                audio_wav_path = str(extract_audio(Path(req.input_path)))
+                logger.info(f"Extracted WAV for sample-accurate cuts: {audio_wav_path}")
+            except Exception as e:
+                logger.warning(f"WAV extraction failed, falling back to AAC cuts: {e}")
+
         try:
             if use_stream_copy:
                 output = export_stream_copy(req.input_path, req.output_path, segments)
@@ -98,6 +111,7 @@ async def export_video(req: ExportRequest):
                     ass_path,
                     resolution=req.resolution,
                     format_hint=req.format,
+                    audio_wav_path=audio_wav_path,
                 )
             else:
                 output = export_reencode(
@@ -106,10 +120,16 @@ async def export_video(req: ExportRequest):
                     segments,
                     resolution=req.resolution,
                     format_hint=req.format,
+                    audio_wav_path=audio_wav_path,
                 )
         finally:
             if ass_path and os.path.exists(ass_path):
                 os.unlink(ass_path)
+            if audio_wav_path and os.path.exists(audio_wav_path):
+                try:
+                    os.unlink(audio_wav_path)
+                except OSError:
+                    pass
 
         # Audio enhancement: clean, then mux back into the exported video
         if req.enhanceAudio:

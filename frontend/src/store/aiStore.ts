@@ -61,7 +61,7 @@ export const useAIStore = create<AIState & AIActions>()(
       providers: {
         ollama: { provider: 'ollama', baseUrl: 'http://localhost:11434', model: 'llama3' },
         openai: { provider: 'openai', apiKey: '', model: 'gpt-4o' },
-        claude: { provider: 'claude', apiKey: '', model: 'claude-sonnet-4-20250514' },
+        claude: { provider: 'claude', apiKey: '', model: 'claude-sonnet-4-6' },
       },
       defaultProvider: 'ollama',
       customFillerWords: '',
