@@ -13,18 +13,25 @@ from typing import Optional
 import torch
 
 
-# Cache key is derived from the key transcription parameters so it automatically
-# invalidates whenever settings change — no manual version bumping needed.
-_TRANSCRIPTION_SETTINGS = {
-    "condition_on_previous_text": False,
-    "no_speech_threshold": 0.8,
-    "compression_ratio_threshold": 1.8,
-    "beam_size": 5,
-    "temperature": 0.0,
-}
-_CACHE_OP = "transcribe_wx_" + hashlib.md5(
-    json.dumps(_TRANSCRIPTION_SETTINGS, sort_keys=True).encode()
-).hexdigest()[:8]
+def _make_cache_op(beam_size: int, vad_filter: bool, vad_min_silence_ms: int) -> str:
+    """
+    Build a cache-op string that encodes all variable transcription settings.
+    Different combinations produce different hashes so cached results are never
+    reused across setting changes.
+    """
+    settings = {
+        "condition_on_previous_text": False,
+        "temperature": 0.0,
+        "beam_size": beam_size,
+        "vad_filter": vad_filter,
+        "vad_min_silence_ms": vad_min_silence_ms if vad_filter else 0,
+        # Noise-suppression thresholds are disabled when VAD handles segmentation
+        "no_speech_threshold": None if vad_filter else 0.8,
+        "compression_ratio_threshold": None if vad_filter else 1.8,
+    }
+    return "transcribe_wx_" + hashlib.md5(
+        json.dumps(settings, sort_keys=True).encode()
+    ).hexdigest()[:8]
 
 from utils.gpu_utils import get_optimal_device, configure_gpu
 from utils.audio_processing import extract_audio, preprocess_audio_for_transcription
@@ -46,6 +53,50 @@ try:
 except Exception:
     HF_TOKEN = ""
 
+# Maps faster-whisper model names to their HuggingFace repo IDs.
+# Mirrors the _MODELS dict in faster-whisper so we can resolve local cache paths.
+_FASTER_WHISPER_REPOS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "tiny.en": "Systran/faster-whisper-tiny.en",
+    "base": "Systran/faster-whisper-base",
+    "base.en": "Systran/faster-whisper-base.en",
+    "small": "Systran/faster-whisper-small",
+    "small.en": "Systran/faster-whisper-small.en",
+    "medium": "Systran/faster-whisper-medium",
+    "medium.en": "Systran/faster-whisper-medium.en",
+    "large-v1": "Systran/faster-whisper-large-v1",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large": "Systran/faster-whisper-large-v3",
+    "distil-large-v2": "Systran/faster-distil-whisper-large-v2",
+    "distil-medium.en": "Systran/faster-distil-whisper-medium.en",
+    "distil-small.en": "Systran/faster-distil-whisper-small.en",
+    "distil-large-v3": "Systran/faster-distil-whisper-large-v3",
+}
+
+
+def _resolve_model_path(model_name: str) -> str:
+    """
+    Return a local filesystem path for the model if it is already in the
+    HuggingFace Hub cache, otherwise return the model name unchanged so the
+    caller can trigger a normal download.
+
+    Passing a local path to faster-whisper / WhisperX skips all HuggingFace
+    network calls (revision checks, HEAD requests, xet-read-token fetches)
+    which otherwise fire on every load even when the model is fully cached.
+    """
+    repo_id = _FASTER_WHISPER_REPOS.get(model_name)
+    if repo_id is None:
+        return model_name
+    try:
+        from huggingface_hub import snapshot_download
+        local_path = snapshot_download(repo_id, local_files_only=True)
+        logger.info(f"Using cached model at {local_path}")
+        return local_path
+    except Exception:
+        # Not cached yet — fall through to normal (downloading) load.
+        return model_name
+
 
 def _get_device(use_gpu: bool = True) -> torch.device:
     if use_gpu:
@@ -66,10 +117,14 @@ def _load_model(model_name: str, device: torch.device):
         logger.info("MPS not supported by faster-whisper, falling back to CPU int8")
     compute_type = "float16" if actual_device.type == "cuda" else "int8"
 
+    # Resolve to a local path when the model is already cached so that
+    # faster-whisper/WhisperX never makes network requests on load.
+    model_id = _resolve_model_path(model_name)
+
     logger.info(f"Loading model: {model_name} on {actual_device}")
     if WHISPERX_AVAILABLE:
         model = whisperx.load_model(
-            model_name,
+            model_id,
             device=str(actual_device),
             compute_type=compute_type,
         )
@@ -87,6 +142,9 @@ def transcribe_audio(
     use_cache: bool = True,
     language: Optional[str] = None,
     initial_prompt: Optional[str] = None,
+    beam_size: int = 5,
+    vad_filter: bool = False,
+    vad_min_silence_ms: int = 500,
     progress_cb=None,
 ) -> dict:
     """
@@ -96,9 +154,10 @@ def transcribe_audio(
         dict with keys: words, segments, language
     """
     file_path = Path(file_path)
+    cache_op = _make_cache_op(beam_size, vad_filter, vad_min_silence_ms)
 
     if use_cache:
-        cached = load_from_cache(file_path, model_name, _CACHE_OP)
+        cached = load_from_cache(file_path, model_name, cache_op)
         if cached:
             logger.info("Using cached transcription")
             return cached
@@ -124,7 +183,11 @@ def transcribe_audio(
     logger.info(f"Transcribing: {file_path}")
 
     if WHISPERX_AVAILABLE:
-        result = _transcribe_whisperx(model, str(preprocessed_path), actual_device, language, initial_prompt, progress_cb=progress_cb)
+        result = _transcribe_whisperx(
+            model, str(preprocessed_path), actual_device, language, initial_prompt,
+            beam_size=beam_size, vad_filter=vad_filter, vad_min_silence_ms=vad_min_silence_ms,
+            progress_cb=progress_cb,
+        )
     else:
         if progress_cb:
             progress_cb(10, "Transcribing...")
@@ -133,7 +196,7 @@ def transcribe_audio(
             progress_cb(95, "Finalizing...")
 
     if use_cache:
-        save_to_cache(file_path, result, model_name, _CACHE_OP)
+        save_to_cache(file_path, result, model_name, cache_op)
 
     return result
 
@@ -180,7 +243,17 @@ def _deduplicate_segments(segments: list) -> list:
     return out
 
 
-def _transcribe_whisperx(model, audio_path: str, device: torch.device, language: Optional[str], initial_prompt: Optional[str] = None, progress_cb=None) -> dict:
+def _transcribe_whisperx(
+    model,
+    audio_path: str,
+    device: torch.device,
+    language: Optional[str],
+    initial_prompt: Optional[str] = None,
+    beam_size: int = 5,
+    vad_filter: bool = False,
+    vad_min_silence_ms: int = 500,
+    progress_cb=None,
+) -> dict:
     def _p(pct: int, status: str):
         if progress_cb:
             progress_cb(pct, status)
@@ -188,23 +261,27 @@ def _transcribe_whisperx(model, audio_path: str, device: torch.device, language:
     audio = whisperx.load_audio(audio_path)
     _p(10, "Transcribing...")
 
-    transcribe_opts = {
-        "vad_filter": False,
+    transcribe_opts: dict = {
         "chunk_length": 30,
-        # beam_size=5 + temperature=0.0 gives deterministic beam decoding without
-        # the fallback temperature ramp.
-        "beam_size": 5,
+        "beam_size": beam_size,
         "temperature": 0.0,
         # Disable previous-text conditioning: feeding prior chunk text into the next
         # decoder pass is a documented cause of repetition loops at chunk boundaries.
         "condition_on_previous_text": False,
-        # Suppress segments where the model has low confidence there is speech —
-        # default 0.6 lets noise/silence through and triggers hallucinations.
-        "no_speech_threshold": 0.8,
-        # Reject output whose compression ratio signals repeated or looping text.
-        # Default 2.4 is too permissive; 1.8 catches most repetition artifacts early.
-        "compression_ratio_threshold": 1.8,
     }
+
+    if vad_filter:
+        # When VAD handles segmentation, the noise-suppression thresholds can
+        # conflict with it — disable them and let VAD own the silence decisions.
+        transcribe_opts["vad_filter"] = True
+        transcribe_opts["vad_parameters"] = {"min_silence_duration_ms": vad_min_silence_ms}
+    else:
+        transcribe_opts["vad_filter"] = False
+        # Suppress segments where the model has low confidence there is speech.
+        transcribe_opts["no_speech_threshold"] = 0.8
+        # Reject output whose compression ratio signals repeated or looping text.
+        transcribe_opts["compression_ratio_threshold"] = 1.8
+
     if language:
         transcribe_opts["language"] = language
     if initial_prompt:

@@ -16,6 +16,7 @@ import {
   Loader2,
   FolderSearch,
   FileInput,
+  ChevronRight,
 } from 'lucide-react';
 
 const IS_ELECTRON = !!window.electronAPI;
@@ -47,6 +48,16 @@ export default function App() {
   const [vocabPrompt, setVocabPrompt] = useState('');
   const [transcribeStatus, setTranscribeStatus] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Advanced transcription options
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [language, setLanguage] = useState(() => localStorage.getItem('txLanguage') ?? '');
+  const [beamSize, setBeamSize] = useState(() => parseInt(localStorage.getItem('txBeamSize') ?? '5'));
+  const [vadFilter, setVadFilter] = useState(() => localStorage.getItem('txVadFilter') === 'true');
+  const [vadMinSilenceMs, setVadMinSilenceMs] = useState(() => parseInt(localStorage.getItem('txVadMinSilenceMs') ?? '500'));
+  const [diarize, setDiarize] = useState(false);
+  const [hfToken, setHfToken] = useState('');
+  const [numSpeakers, setNumSpeakers] = useState('');
 
   useKeyboardShortcuts();
 
@@ -106,6 +117,13 @@ export default function App() {
           file_path: path,
           model: whisperModel,
           initial_prompt: vocabPrompt.trim() || undefined,
+          language: language || undefined,
+          beam_size: beamSize,
+          vad_filter: vadFilter,
+          vad_min_silence_ms: vadMinSilenceMs,
+          diarize,
+          hf_token: diarize && hfToken ? hfToken : undefined,
+          num_speakers: diarize && numSpeakers ? parseInt(numSpeakers) : undefined,
         }),
       });
       if (!res.ok) throw new Error(`Transcription failed: ${res.statusText}`);
@@ -180,12 +198,12 @@ export default function App() {
               }}
               className="flex-1 px-3 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
             >
-              <option value="tiny">tiny (~75 MB, fastest)</option>
-              <option value="base">base (~140 MB, fast)</option>
-              <option value="small">small (~460 MB, good)</option>
-              <option value="medium">medium (~1.5 GB, better)</option>
-              <option value="large-v3">large-v3 (~3.1 GB, best, multilingual)</option>
-              <option value="distil-large-v3">distil-large-v3 (~1.6 GB, great + fast)</option>
+              <option value="tiny">faster-whisper tiny (~75 MB, fastest)</option>
+              <option value="base">faster-whisper base (~140 MB, fast)</option>
+              <option value="small">faster-whisper small (~460 MB, good)</option>
+              <option value="medium">faster-whisper medium (~1.5 GB, better)</option>
+              <option value="large-v3">faster-whisper large-v3 (~3.1 GB, best, multilingual)</option>
+              <option value="distil-large-v3">faster-whisper distil-large-v3 (~1.6 GB, great + fast)</option>
             </select>
           </div>
           <div className="flex flex-col gap-1 w-full">
@@ -200,6 +218,142 @@ export default function App() {
               rows={2}
               className="w-full px-3 py-2 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text placeholder:text-editor-text-muted/40 focus:outline-none focus:border-editor-accent resize-none"
             />
+          </div>
+
+          {/* Advanced options */}
+          <div className="w-full">
+            <button
+              onClick={() => setShowAdvanced((v) => !v)}
+              className="flex items-center gap-1 text-xs text-editor-text-muted hover:text-editor-text transition-colors"
+            >
+              <ChevronRight className={`w-3 h-3 transition-transform duration-150 ${showAdvanced ? 'rotate-90' : ''}`} />
+              Advanced options
+            </button>
+
+            {showAdvanced && (
+              <div className="mt-3 flex flex-col gap-4 border-l border-editor-border pl-3">
+
+                {/* Language */}
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-editor-text-muted w-20 shrink-0">Language</label>
+                  <select
+                    value={language}
+                    onChange={(e) => { setLanguage(e.target.value); localStorage.setItem('txLanguage', e.target.value); }}
+                    className="flex-1 px-2 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
+                  >
+                    <option value="">Auto-detect</option>
+                    <option value="en">English</option>
+                    <option value="es">Spanish</option>
+                    <option value="fr">French</option>
+                    <option value="de">German</option>
+                    <option value="it">Italian</option>
+                    <option value="pt">Portuguese</option>
+                    <option value="zh">Chinese</option>
+                    <option value="ja">Japanese</option>
+                    <option value="ko">Korean</option>
+                    <option value="nl">Dutch</option>
+                    <option value="ru">Russian</option>
+                    <option value="ar">Arabic</option>
+                    <option value="hi">Hindi</option>
+                  </select>
+                </div>
+
+                {/* Beam size */}
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-editor-text-muted w-20 shrink-0">Beam size</label>
+                  <select
+                    value={beamSize}
+                    onChange={(e) => { setBeamSize(Number(e.target.value)); localStorage.setItem('txBeamSize', e.target.value); }}
+                    className="flex-1 px-2 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
+                  >
+                    <option value={1}>1 — fastest, least accurate</option>
+                    <option value={3}>3</option>
+                    <option value={5}>5 — default (balanced)</option>
+                    <option value={8}>8</option>
+                    <option value={10}>10 — slowest, most accurate</option>
+                  </select>
+                </div>
+
+                {/* VAD filter */}
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={vadFilter}
+                      onChange={(e) => { setVadFilter(e.target.checked); localStorage.setItem('txVadFilter', String(e.target.checked)); }}
+                      className="mt-0.5 accent-editor-accent"
+                    />
+                    <span className="text-xs text-editor-text leading-snug">
+                      VAD filter
+                      <span className="block text-editor-text-muted mt-0.5">
+                        Voice activity detection — improves segmentation for recordings with pauses or long silences. Recommended for interviews and multi-speaker recordings.
+                      </span>
+                    </span>
+                  </label>
+                  {vadFilter && (
+                    <div className="flex items-center gap-2 pl-5">
+                      <label className="text-xs text-editor-text-muted whitespace-nowrap">Min silence</label>
+                      <input
+                        type="number"
+                        value={vadMinSilenceMs}
+                        onChange={(e) => { setVadMinSilenceMs(Number(e.target.value)); localStorage.setItem('txVadMinSilenceMs', e.target.value); }}
+                        min={100}
+                        max={2000}
+                        step={50}
+                        className="w-20 px-2 py-1 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
+                      />
+                      <span className="text-xs text-editor-text-muted">ms</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Speaker diarization */}
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-start gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={diarize}
+                      onChange={(e) => setDiarize(e.target.checked)}
+                      className="mt-0.5 accent-editor-accent"
+                    />
+                    <span className="text-xs text-editor-text leading-snug">
+                      Speaker diarization
+                      <span className="block text-editor-text-muted mt-0.5">
+                        Automatically detects and labels different speakers (Speaker 1, Speaker 2…). Useful for interviews, meetings, and any recording with multiple voices. Requires a free HuggingFace token.
+                      </span>
+                    </span>
+                  </label>
+                  {diarize && (
+                    <div className="flex flex-col gap-2 pl-5">
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs text-editor-text-muted w-16 shrink-0">HF Token</label>
+                        <input
+                          type="password"
+                          value={hfToken}
+                          onChange={(e) => setHfToken(e.target.value)}
+                          placeholder="hf_..."
+                          className="flex-1 px-2 py-1 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text placeholder:text-editor-text-muted/40 focus:outline-none focus:border-editor-accent"
+                        />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs text-editor-text-muted w-16 shrink-0">Speakers</label>
+                        <input
+                          type="number"
+                          value={numSpeakers}
+                          onChange={(e) => setNumSpeakers(e.target.value)}
+                          placeholder="auto"
+                          min={1}
+                          max={20}
+                          className="w-16 px-2 py-1 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text placeholder:text-editor-text-muted/40 focus:outline-none focus:border-editor-accent"
+                        />
+                        <span className="text-xs text-editor-text-muted">optional</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+              </div>
+            )}
           </div>
         </div>
 

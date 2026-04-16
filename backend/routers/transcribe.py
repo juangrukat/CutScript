@@ -17,18 +17,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3", "distil-large-v3"}
+ALLOWED_BEAM_SIZES = {1, 3, 5, 8, 10}
 
 
 class TranscribeRequest(BaseModel):
     file_path: str
     model: str = "base"
-
-    @field_validator("model")
-    @classmethod
-    def validate_model(cls, v: str) -> str:
-        if v not in ALLOWED_MODELS:
-            raise ValueError(f"Unknown model '{v}'. Allowed: {sorted(ALLOWED_MODELS)}")
-        return v
     language: Optional[str] = None
     use_gpu: bool = True
     use_cache: bool = True
@@ -36,6 +30,30 @@ class TranscribeRequest(BaseModel):
     hf_token: Optional[str] = None
     num_speakers: Optional[int] = None
     initial_prompt: Optional[str] = None
+    beam_size: int = 5
+    vad_filter: bool = False
+    vad_min_silence_ms: int = 500
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v: str) -> str:
+        if v not in ALLOWED_MODELS:
+            raise ValueError(f"Unknown model '{v}'. Allowed: {sorted(ALLOWED_MODELS)}")
+        return v
+
+    @field_validator("beam_size")
+    @classmethod
+    def validate_beam_size(cls, v: int) -> int:
+        if v not in ALLOWED_BEAM_SIZES:
+            raise ValueError(f"beam_size must be one of {sorted(ALLOWED_BEAM_SIZES)}")
+        return v
+
+    @field_validator("vad_min_silence_ms")
+    @classmethod
+    def validate_vad_min_silence_ms(cls, v: int) -> int:
+        if not (100 <= v <= 2000):
+            raise ValueError("vad_min_silence_ms must be between 100 and 2000")
+        return v
 
 
 @router.post("/transcribe")
@@ -48,6 +66,9 @@ async def transcribe(req: TranscribeRequest):
             use_cache=req.use_cache,
             language=req.language,
             initial_prompt=req.initial_prompt or None,
+            beam_size=req.beam_size,
+            vad_filter=req.vad_filter,
+            vad_min_silence_ms=req.vad_min_silence_ms,
         )
 
         if req.diarize and req.hf_token:
@@ -99,6 +120,9 @@ async def transcribe_stream(req: TranscribeRequest):
                 use_cache=req.use_cache,
                 language=req.language,
                 initial_prompt=req.initial_prompt or None,
+                beam_size=req.beam_size,
+                vad_filter=req.vad_filter,
+                vad_min_silence_ms=req.vad_min_silence_ms,
                 progress_cb=on_progress,
             )
 
