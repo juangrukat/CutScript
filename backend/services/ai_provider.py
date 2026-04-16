@@ -65,20 +65,31 @@ def _ollama_complete(prompt: str, model: str, base_url: str, system_prompt: Opti
 
 def _openai_complete(prompt: str, model: str, api_key: str, system_prompt: Optional[str], temperature: float) -> str:
     try:
-        from openai import OpenAI
+        from openai import OpenAI, BadRequestError
         client = OpenAI(api_key=api_key)
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        # Reasoning models (o1, o3, o4-mini, etc.) only support the default temperature
-        is_reasoning_model = model.startswith(("o1", "o3", "o4"))
+        # Reasoning models (o1, o3, o4-mini, etc.) and newer models (gpt-5, etc.)
+        # only accept the default temperature. Start without it for known families,
+        # and fall back to omitting it if the API rejects the value.
+        is_fixed_temperature_model = model.startswith(("o1", "o3", "o4", "gpt-5"))
         kwargs = {"model": model, "messages": messages}
-        if not is_reasoning_model:
+        if not is_fixed_temperature_model:
             kwargs["temperature"] = temperature
 
-        response = client.chat.completions.create(**kwargs)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except BadRequestError as e:
+            if "temperature" in str(e) and "temperature" in kwargs:
+                logger.warning(f"Model {model} rejected temperature param, retrying without it")
+                del kwargs["temperature"]
+                response = client.chat.completions.create(**kwargs)
+            else:
+                raise
+
         return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"OpenAI error: {e}")

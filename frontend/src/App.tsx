@@ -35,9 +35,15 @@ export default function App() {
     backendUrl,
   } = useEditorStore();
 
+  const VALID_WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3', 'distil-large-v3'] as const;
+  type WhisperModel = typeof VALID_WHISPER_MODELS[number];
+
   const [activePanel, setActivePanel] = useState<Panel>(null);
   const [manualPath, setManualPath] = useState('');
-  const [whisperModel, setWhisperModel] = useState('base');
+  const [whisperModel, setWhisperModel] = useState<WhisperModel>(() => {
+    const saved = localStorage.getItem('whisperModel') as WhisperModel | null;
+    return saved && VALID_WHISPER_MODELS.includes(saved) ? saved : 'base';
+  });
   const [vocabPrompt, setVocabPrompt] = useState('');
   const [transcribeStatus, setTranscribeStatus] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -167,7 +173,11 @@ export default function App() {
             <label className="text-xs text-editor-text-muted whitespace-nowrap">Whisper model:</label>
             <select
               value={whisperModel}
-              onChange={(e) => setWhisperModel(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value as WhisperModel;
+                setWhisperModel(v);
+                localStorage.setItem('whisperModel', v);
+              }}
               className="flex-1 px-3 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
             >
               <option value="tiny">tiny (~75 MB, fastest)</option>

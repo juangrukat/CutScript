@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from services.transcription import transcribe_audio
 from services.diarization import diarize_and_label
@@ -16,10 +16,19 @@ from services.diarization import diarize_and_label
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3", "distil-large-v3"}
+
 
 class TranscribeRequest(BaseModel):
     file_path: str
     model: str = "base"
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v: str) -> str:
+        if v not in ALLOWED_MODELS:
+            raise ValueError(f"Unknown model '{v}'. Allowed: {sorted(ALLOWED_MODELS)}")
+        return v
     language: Optional[str] = None
     use_gpu: bool = True
     use_cache: bool = True

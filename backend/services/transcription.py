@@ -12,6 +12,7 @@ from typing import Optional
 
 import torch
 
+
 # Cache key is derived from the key transcription parameters so it automatically
 # invalidates whenever settings change — no manual version bumping needed.
 _TRANSCRIPTION_SETTINGS = {
@@ -235,22 +236,29 @@ def _transcribe_whisperx(model, audio_path: str, device: torch.device, language:
     segments_for_align = _deduplicate_segments(segments_for_align)
 
     _p(72, "Aligning words...")
-    align_model, align_metadata = whisperx.load_align_model(
-        language_code=detected_language,
-        device=str(device),
-    )
-    _p(80, "Aligning words...")
-    aligned = whisperx.align(
-        segments_for_align,
-        align_model,
-        align_metadata,
-        audio,
-        str(device),
-        return_char_alignments=False,
-    )
-    _p(95, "Finalizing...")
-
-    aligned_segments = _deduplicate_segments(aligned.get("segments", []))
+    try:
+        align_model, align_metadata = whisperx.load_align_model(
+            language_code=detected_language,
+            device=str(device),
+        )
+        _p(80, "Aligning words...")
+        aligned = whisperx.align(
+            segments_for_align,
+            align_model,
+            align_metadata,
+            audio,
+            str(device),
+            return_char_alignments=False,
+        )
+        _p(95, "Finalizing...")
+        aligned_segments = _deduplicate_segments(aligned.get("segments", []))
+    except Exception as align_err:
+        logger.warning(
+            f"Word alignment failed for language '{detected_language}', "
+            f"falling back to segment-level timestamps: {align_err}"
+        )
+        _p(95, "Finalizing...")
+        aligned_segments = segments_for_align
 
     words = []
     for seg in aligned_segments:
