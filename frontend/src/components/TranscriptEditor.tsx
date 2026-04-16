@@ -33,13 +33,17 @@ export default function TranscriptEditor() {
 
   useEffect(() => {
     if (words.length === 0) return;
-    const interval = setInterval(() => {
+    let raf: number;
+    const tick = () => {
       const video = document.querySelector('video') as HTMLVideoElement | null;
-      if (!video) return;
-      const idx = getWordAtTime(video.currentTime);
-      setActiveWordIndex((prev) => (prev === idx ? prev : idx));
-    }, 250);
-    return () => clearInterval(interval);
+      if (video) {
+        const idx = getWordAtTime(video.currentTime);
+        setActiveWordIndex((prev) => (prev === idx ? prev : idx));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, [words, getWordAtTime]);
 
   // Auto-scroll to active segment via Virtuoso

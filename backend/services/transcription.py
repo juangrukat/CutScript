@@ -186,7 +186,9 @@ def transcribe_audio(
 
     # Preprocess: trim leading silence and normalize loudness before Whisper sees
     # the audio. Leading silence is a documented cause of hallucination/drift.
-    preprocessed_path = preprocess_audio_for_transcription(Path(audio_path))
+    # preprocess_audio_for_transcription returns (path, trim_offset_seconds) so
+    # we can shift all timestamps back onto the original timeline afterwards.
+    preprocessed_path, trim_offset = preprocess_audio_for_transcription(Path(audio_path))
 
     device = _get_device(use_gpu)
     model = _load_model(model_name, device)
@@ -211,9 +213,28 @@ def transcribe_audio(
         if progress_cb:
             progress_cb(95, "Finalizing...")
 
+    # Shift all timestamps forward by the amount of leading silence that was
+    # stripped during preprocessing, so they align with the original video timeline.
+    if trim_offset > 0:
+        result = _apply_timestamp_offset(result, trim_offset)
+
     if use_cache:
         save_to_cache(file_path, result, model_name, cache_op)
 
+    return result
+
+
+def _apply_timestamp_offset(result: dict, offset: float) -> dict:
+    """Add offset (seconds) to every word and segment timestamp in-place."""
+    for word in result.get("words", []):
+        word["start"] = round(word["start"] + offset, 3)
+        word["end"] = round(word["end"] + offset, 3)
+    for seg in result.get("segments", []):
+        seg["start"] = round(seg["start"] + offset, 3)
+        seg["end"] = round(seg["end"] + offset, 3)
+        for word in seg.get("words", []):
+            word["start"] = round(word["start"] + offset, 3)
+            word["end"] = round(word["end"] + offset, 3)
     return result
 
 

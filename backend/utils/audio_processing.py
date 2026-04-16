@@ -49,7 +49,22 @@ def cleanup_temp_audio():
     return cleaned
 
 
-def preprocess_audio_for_transcription(audio_path: Path) -> Path:
+def _get_duration(audio_path: Path) -> float:
+    """Return the duration of an audio/video file in seconds via ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def preprocess_audio_for_transcription(audio_path: Path) -> tuple[Path, float]:
     """
     Whisper-optimized preprocessing: trim leading silence and normalize loudness.
 
@@ -58,10 +73,19 @@ def preprocess_audio_for_transcription(audio_path: Path) -> Path:
     Loudnorm ensures the signal is in a range Whisper handles well regardless of
     recording level.
 
-    Falls back to the raw audio path if FFmpeg preprocessing fails so transcription
-    is never blocked by a preprocessing error.
+    Returns (preprocessed_path, trim_offset_seconds) so callers can shift
+    WhisperX timestamps back to match the original timeline.  silenceremove
+    physically removes audio frames, so all timestamps produced by Whisper are
+    relative to the trimmed file — without the offset they will be systematically
+    early by however many seconds of silence were stripped.
+
+    Falls back to the raw audio path (offset 0.0) if FFmpeg preprocessing fails
+    so transcription is never blocked by a preprocessing error.
     """
     output_path = audio_path.parent / f"{audio_path.stem}_prep.wav"
+
+    original_duration = _get_duration(audio_path)
+
     cmd = [
         "ffmpeg", "-y",
         "-i", str(audio_path),
@@ -74,8 +98,16 @@ def preprocess_audio_for_transcription(audio_path: Path) -> Path:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.warning(f"Transcription audio preprocessing failed, using raw audio: {result.stderr[-200:]}")
-        return audio_path
-    return output_path
+        return audio_path, 0.0
+
+    preprocessed_duration = _get_duration(output_path)
+    # silenceremove with start_periods=1 removes exactly one leading silence
+    # block, so the duration difference is the timestamp offset to add back.
+    trim_offset = round(max(0.0, original_duration - preprocessed_duration), 3)
+    if trim_offset > 0:
+        logger.info(f"Leading silence trimmed: {trim_offset:.3f}s — will shift timestamps by this amount")
+
+    return output_path, trim_offset
 
 
 def get_video_duration(video_path: Path):
