@@ -127,12 +127,15 @@ export default function AIPanel() {
     [setCurrentTime],
   );
 
-  const [exportingClipIndex, setExportingClipIndex] = useState<number | null>(null);
+  const [exportingClips, setExportingClips] = useState<Set<number>>(new Set());
+  const [exportedClips, setExportedClips] = useState<Set<number>>(new Set());
+  const [exportErrors, setExportErrors] = useState<Set<number>>(new Set());
 
   const handleExportClip = useCallback(
     async (clip: ClipSuggestion, index: number) => {
       if (!videoPath) return;
-      setExportingClipIndex(index);
+      setExportingClips((prev) => new Set(prev).add(index));
+      setExportErrors((prev) => { const next = new Set(prev); next.delete(index); return next; });
       try {
         const safeName = clip.title.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 40);
         const dirSep = videoPath.lastIndexOf('\\') >= 0 ? '\\' : '/';
@@ -151,17 +154,26 @@ export default function AIPanel() {
           }),
         });
         if (!res.ok) throw new Error('Export failed');
-        const data = await res.json();
-        alert(`Clip exported to: ${data.output_path}`);
+        setExportedClips((prev) => {
+          const next = new Set(prev).add(index);
+          setTimeout(() => setExportedClips((s) => { const n = new Set(s); n.delete(index); return n; }), 4000);
+          return next;
+        });
       } catch (err) {
         console.error(err);
-        alert('Failed to export clip. Check console for details.');
+        setExportErrors((prev) => new Set(prev).add(index));
       } finally {
-        setExportingClipIndex(null);
+        setExportingClips((prev) => { const next = new Set(prev); next.delete(index); return next; });
       }
     },
     [videoPath, backendUrl],
   );
+
+  const handleExportAllClips = useCallback(async () => {
+    for (let i = 0; i < clipSuggestions.length; i++) {
+      await handleExportClip(clipSuggestions[i], i);
+    }
+  }, [clipSuggestions, handleExportClip]);
 
   return (
     <div className="flex flex-col h-full">
@@ -293,6 +305,19 @@ export default function AIPanel() {
 
             {clipSuggestions.length > 0 && (
               <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-editor-text-muted">
+                    Stream copy · lossless · original quality
+                  </span>
+                  <button
+                    onClick={handleExportAllClips}
+                    disabled={exportingClips.size > 0}
+                    className="flex items-center gap-1 px-2 py-1 text-[10px] bg-editor-success/20 text-editor-success rounded hover:bg-editor-success/30 disabled:opacity-50 transition-colors"
+                  >
+                    <Download className="w-3 h-3" />
+                    Export All
+                  </button>
+                </div>
                 {clipSuggestions.map((clip, i) => (
                   <div key={i} className="p-3 bg-editor-surface rounded-lg space-y-2">
                     <div className="flex items-center justify-between">
@@ -311,15 +336,25 @@ export default function AIPanel() {
                       </button>
                       <button
                         onClick={() => handleExportClip(clip, i)}
-                        disabled={exportingClipIndex === i}
-                        className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 text-xs bg-editor-success/20 text-editor-success rounded hover:bg-editor-success/30 disabled:opacity-50 transition-colors"
+                        disabled={exportingClips.has(i)}
+                        className={`flex-1 flex items-center justify-center gap-1 px-2 py-1.5 text-xs rounded disabled:opacity-50 transition-colors ${
+                          exportedClips.has(i)
+                            ? 'bg-editor-success/30 text-editor-success'
+                            : exportErrors.has(i)
+                              ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
+                              : 'bg-editor-success/20 text-editor-success hover:bg-editor-success/30'
+                        }`}
                       >
-                        {exportingClipIndex === i ? (
+                        {exportingClips.has(i) ? (
                           <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : exportedClips.has(i) ? (
+                          <Check className="w-3 h-3" />
+                        ) : exportErrors.has(i) ? (
+                          <X className="w-3 h-3" />
                         ) : (
                           <Download className="w-3 h-3" />
                         )}
-                        Export
+                        {exportingClips.has(i) ? 'Exporting...' : exportedClips.has(i) ? 'Saved!' : exportErrors.has(i) ? 'Failed' : 'Export'}
                       </button>
                     </div>
                   </div>
