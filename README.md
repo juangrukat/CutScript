@@ -10,6 +10,7 @@ An open-source, local-first, Descript-like text-based audio and video editor pow
 - **Electron + React** desktop app with Tailwind CSS
 - **FastAPI** Python backend (spawned as child process)
 - **WhisperX** for word-level transcription with alignment
+- **librosa** for audio boundary refinement (natural splice-point detection, interior gap speech detection, zero-crossing snap)
 - **FFmpeg** for video processing (stream-copy and re-encode)
 - **Ollama / OpenAI / Claude** for AI features (filler removal, clip creation)
 
@@ -31,8 +32,8 @@ npm install
 # Frontend dependencies (React, Tailwind, Zustand)
 cd frontend && npm install && cd ..
 
-# Backend dependencies
-cd backend && pip install -r requirements.txt && cd ..
+# Backend dependencies (run from repo root)
+pip install -r requirements.txt
 ```
 
 ### Run (Development)
@@ -88,6 +89,12 @@ cutscript/
 | FFmpeg stream-copy export | Done |
 | FFmpeg re-encode (up to 4K) | Done |
 | Seamless audio cuts (boundary fades + loudness normalization) | Done |
+| Audio splice-point refinement (RMS energy + zero-crossing snap) | Done |
+| AcousticMap ingest-time analysis (per-word fricative/stop/nasal/vowel fingerprints) | Done |
+| Phoneme-class-aware coda decay (preserves fricative tails like /ʃ/ in "Spanish") | Done |
+| Interior gap speech detection (word-level vs silence-level cut routing) | Done |
+| Bias guard (prevents ZC snap landing inside deleted words) | Done |
+| Cache management UI (transcripts + spectral maps, per-type clear) | Done |
 | AI filler word removal | Done |
 | AI clip creation (Shorts) | Done |
 | Ollama + OpenAI + Claude | Done |
@@ -125,6 +132,9 @@ cutscript/
 | GET | /health | Health check |
 | POST | /transcribe | Transcribe video with WhisperX |
 | POST | /transcribe/stream | Transcribe with real-time SSE progress |
+| POST | /analyze | Build AcousticMap (per-word spectral fingerprints) |
+| GET | /cache/sizes | Report transcript + spectral cache sizes |
+| POST | /cache/clear/{kind} | Clear `transcripts` or `spectral` cache |
 | POST | /export | Export edited video (stream copy or re-encode) |
 | POST | /ai/filler-removal | Detect filler words via LLM |
 | POST | /ai/create-clip | AI-suggested clips for shorts |

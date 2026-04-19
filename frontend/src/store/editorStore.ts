@@ -186,25 +186,24 @@ export const useEditorStore = create<EditorState & EditorActions>()(
           segments.push({ start: segStart, end: words[words.length - 1].end });
         }
 
-        // Pad first segment start and last segment end by 1.5s to preserve
-        // the silent intro and outro (music before first word / after last word),
-        // but clamp against adjacent deleted ranges so the padding never bleeds
-        // into content the user explicitly cut.
         if (segments.length > 0) {
           const firstSeg = segments[0];
           const lastSeg = segments[segments.length - 1];
 
-          // Furthest end-time of any deleted range that sits before the first keep segment
           const prevDeletedEnd = deletedRanges
             .filter((r) => r.end <= firstSeg.start)
             .reduce((max, r) => Math.max(max, r.end), 0);
-          firstSeg.start = Math.max(prevDeletedEnd, firstSeg.start - 1.5);
+          firstSeg.start = Math.max(0, prevDeletedEnd, firstSeg.start - 1.5);
 
-          // Nearest start-time of any deleted range that sits after the last keep segment
+          // If video metadata hasn't loaded yet, `duration` is 0 — seeding the
+          // reducer with 0 would collapse lastSeg.end to 0 and silently drop
+          // the final segment. Use Infinity and apply the duration cap only
+          // when we actually know it.
           const nextDeletedStart = deletedRanges
             .filter((r) => r.start >= lastSeg.end)
-            .reduce((min, r) => Math.min(min, r.start), duration);
-          lastSeg.end = Math.min(nextDeletedStart, lastSeg.end + 1.5);
+            .reduce((min, r) => Math.min(min, r.start), Infinity);
+          const durationCap = duration > 0 ? duration : Infinity;
+          lastSeg.end = Math.min(nextDeletedStart, durationCap, lastSeg.end + 1.5);
         }
 
         return segments;

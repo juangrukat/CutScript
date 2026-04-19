@@ -13,10 +13,6 @@ from typing import Optional
 import torch
 
 
-_VERBATIM_PROMPT = (
-    "Verbatim transcript. Preserve all repeated words, stutters, false starts, "
-    "and filler sounds exactly as spoken."
-)
 
 
 def _make_cache_op(beam_size: int, vad_filter: bool, vad_min_silence_ms: int, verbatim: bool) -> str:
@@ -165,13 +161,6 @@ def transcribe_audio(
     file_path = Path(file_path)
     cache_op = _make_cache_op(beam_size, vad_filter, vad_min_silence_ms, verbatim)
 
-    # In verbatim mode, prepend the verbatim instruction so Whisper preserves
-    # repetitions, stutters, and false starts instead of smoothing them out.
-    if verbatim:
-        initial_prompt = (
-            _VERBATIM_PROMPT + (" " + initial_prompt if initial_prompt else "")
-        )
-
     if use_cache:
         cached = load_from_cache(file_path, model_name, cache_op)
         if cached:
@@ -218,9 +207,35 @@ def transcribe_audio(
     if trim_offset > 0:
         result = _apply_timestamp_offset(result, trim_offset)
 
+    # Drop any words/segments whose timestamps exceed the source audio duration.
+    # These are hallucinations — Whisper sometimes generates text beyond the end
+    # of the file, especially when initial_prompt text leaks into the output.
+    try:
+        import soundfile as sf
+        with sf.SoundFile(str(preprocessed_path)) as f:
+            audio_duration = len(f) / f.samplerate
+        result = _clip_to_duration(result, audio_duration + trim_offset)
+    except Exception:
+        pass
+
     if use_cache:
         save_to_cache(file_path, result, model_name, cache_op)
 
+    return result
+
+
+def _clip_to_duration(result: dict, max_time: float) -> dict:
+    """Remove words and segments whose start timestamp exceeds the audio duration."""
+    original_word_count = len(result.get("words", []))
+    result["words"] = [w for w in result.get("words", []) if w.get("start", 0) <= max_time]
+    result["segments"] = [
+        {**seg, "words": [w for w in seg.get("words", []) if w.get("start", 0) <= max_time]}
+        for seg in result.get("segments", [])
+        if seg.get("start", 0) <= max_time
+    ]
+    clipped = original_word_count - len(result["words"])
+    if clipped > 0:
+        logger.warning(f"Clipped {clipped} hallucinated words beyond audio duration ({max_time:.2f}s)")
     return result
 
 

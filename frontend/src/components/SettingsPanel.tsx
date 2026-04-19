@@ -1,8 +1,8 @@
 import { useAIStore } from '../store/aiStore';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import type { AIProvider } from '../types/project';
 import { useEditorStore } from '../store/editorStore';
-import { Bot, Cloud, Brain, RefreshCw } from 'lucide-react';
+import { Bot, Cloud, Brain, RefreshCw, HardDrive, Trash2 } from 'lucide-react';
 
 export default function SettingsPanel() {
   const { providers, defaultProvider, setProviderConfig, setDefaultProvider } = useAIStore();
@@ -140,6 +140,115 @@ export default function SettingsPanel() {
           placeholder="claude-sonnet-4-6"
         />
       </ProviderSection>
+
+      <CacheManager />
+    </div>
+  );
+}
+
+type CacheSizes = {
+  transcripts_bytes: number;
+  transcripts_files: number;
+  spectral_bytes: number;
+  spectral_files: number;
+};
+
+function formatBytes(b: number) {
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
+  return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function CacheManager() {
+  const { backendUrl } = useEditorStore();
+  const [sizes, setSizes] = useState<CacheSizes | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch(`${backendUrl}/cache/sizes`);
+      if (res.ok) setSizes(await res.json());
+    } catch {
+      setSizes(null);
+    }
+  }, [backendUrl]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const clearOne = async (kind: 'transcripts' | 'spectral') => {
+    if (!confirm(`Delete all ${kind} cache files? You can re-build them by re-opening your videos.`)) return;
+    setBusy(kind);
+    try {
+      await fetch(`${backendUrl}/cache/clear/${kind}`, { method: 'POST' });
+      await refresh();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="space-y-3 p-3 bg-editor-surface rounded-lg">
+      <div className="flex items-center gap-2 text-xs font-medium">
+        <HardDrive className="w-4 h-4" />
+        Cache
+      </div>
+      <CacheRow
+        label="Transcripts"
+        hint="WhisperX results per video"
+        size={sizes ? formatBytes(sizes.transcripts_bytes) : '—'}
+        count={sizes?.transcripts_files ?? 0}
+        onClear={() => clearOne('transcripts')}
+        busy={busy === 'transcripts'}
+      />
+      <CacheRow
+        label="Spectral (AcousticMap)"
+        hint="Per-word fingerprints used by the cut refiner"
+        size={sizes ? formatBytes(sizes.spectral_bytes) : '—'}
+        count={sizes?.spectral_files ?? 0}
+        onClear={() => clearOne('spectral')}
+        busy={busy === 'spectral'}
+      />
+      <button
+        onClick={refresh}
+        className="text-[10px] text-editor-accent hover:underline flex items-center gap-0.5"
+      >
+        <RefreshCw className="w-2.5 h-2.5" />
+        Refresh
+      </button>
+    </div>
+  );
+}
+
+function CacheRow({
+  label, hint, size, count, onClear, busy,
+}: {
+  label: string;
+  hint: string;
+  size: string;
+  count: number;
+  onClear: () => void;
+  busy: boolean;
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-col min-w-0">
+          <span className="text-xs text-editor-text">{label}</span>
+          <span className="text-[10px] text-editor-text-muted">{hint}</span>
+        </div>
+        <button
+          onClick={onClear}
+          disabled={busy || count === 0}
+          className="flex items-center gap-1 px-2 py-1 rounded text-[10px] text-editor-text-muted hover:text-editor-danger disabled:opacity-40 disabled:cursor-not-allowed border border-editor-border hover:border-editor-danger/40 transition-colors"
+        >
+          <Trash2 className="w-3 h-3" />
+          Clear
+        </button>
+      </div>
+      <div className="text-[10px] text-editor-text-muted">
+        {count} file{count === 1 ? '' : 's'} · {size}
+      </div>
     </div>
   );
 }

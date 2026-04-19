@@ -56,6 +56,8 @@ export default function App() {
   const [vadFilter, setVadFilter] = useState(() => localStorage.getItem('txVadFilter') === 'true');
   const [vadMinSilenceMs, setVadMinSilenceMs] = useState(() => parseInt(localStorage.getItem('txVadMinSilenceMs') ?? '500'));
   const [verbatim, setVerbatim] = useState(false);
+  const [showOpenSettings, setShowOpenSettings] = useState(false);
+  const [pendingPath, setPendingPath] = useState<string | null>(null);
   const [diarize, setDiarize] = useState(false);
   const [hfToken, setHfToken] = useState('');
   const [numSpeakers, setNumSpeakers] = useState('');
@@ -85,18 +87,31 @@ export default function App() {
   const handleOpenFile = async () => {
     if (IS_ELECTRON) {
       const path = await window.electronAPI!.openFile();
-      if (path) {
+      if (!path) return;
+      if (videoPath) {
+        // Already editing — let user confirm language/verbatim before transcribing
+        setPendingPath(path);
+        setShowOpenSettings(true);
+      } else {
         loadVideo(path);
         await transcribeVideo(path);
       }
     } else {
-      // Browser: use the manual path input
       const path = manualPath.trim();
       if (path) {
         loadVideo(path);
         await transcribeVideo(path);
       }
     }
+  };
+
+  const handleConfirmOpen = async () => {
+    if (!pendingPath) return;
+    setShowOpenSettings(false);
+    const path = pendingPath;
+    setPendingPath(null);
+    loadVideo(path);
+    await transcribeVideo(path);
   };
 
   const handleManualSubmit = async (e: React.FormEvent) => {
@@ -153,6 +168,24 @@ export default function App() {
               setTranscribeStatus(event.status ?? '');
             } else if (event.type === 'done') {
               setTranscription(event.result);
+              setTranscribing(true, 98);
+              setTranscribeStatus('Analyzing audio...');
+              // Build the AcousticMap so the export refiner can use pre-computed
+              // per-word spectral fingerprints (fricative tails, phoneme classes,
+              // intraword dips). Non-fatal: if this fails, export falls back to
+              // the legacy refiner or rebuilds on demand.
+              try {
+                await fetch(`${backendUrl}/analyze`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    file_path: path,
+                    words: event.result.words,
+                  }),
+                });
+              } catch (analyzeErr) {
+                console.warn('Acoustic analysis failed (non-fatal):', analyzeErr);
+              }
               setTranscribing(false, 100);
               setTranscribeStatus('');
               return;
@@ -525,6 +558,71 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* Open-file settings modal — shown when opening a new video while already editing */}
+      {showOpenSettings && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="bg-editor-surface border border-editor-border rounded-xl shadow-2xl p-6 w-80 flex flex-col gap-5">
+            <h2 className="text-sm font-semibold text-editor-text">Transcription settings</h2>
+
+            {/* Language */}
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-editor-text-muted w-20 shrink-0">Language</label>
+              <select
+                value={language}
+                onChange={(e) => { setLanguage(e.target.value); localStorage.setItem('txLanguage', e.target.value); }}
+                className="flex-1 px-2 py-1.5 bg-editor-bg border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
+              >
+                <option value="">Auto-detect</option>
+                <option value="en">English</option>
+                <option value="es">Spanish</option>
+                <option value="fr">French</option>
+                <option value="de">German</option>
+                <option value="it">Italian</option>
+                <option value="pt">Portuguese</option>
+                <option value="zh">Chinese</option>
+                <option value="ja">Japanese</option>
+                <option value="ko">Korean</option>
+                <option value="nl">Dutch</option>
+                <option value="ru">Russian</option>
+                <option value="ar">Arabic</option>
+                <option value="hi">Hindi</option>
+              </select>
+            </div>
+
+            {/* Verbatim */}
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={verbatim}
+                onChange={(e) => setVerbatim(e.target.checked)}
+                className="mt-0.5 accent-editor-accent"
+              />
+              <span className="text-xs text-editor-text leading-snug">
+                Verbatim mode
+                <span className="block text-editor-text-muted mt-0.5">
+                  Preserve stutters, repeated words, and false starts.
+                </span>
+              </span>
+            </label>
+
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => { setShowOpenSettings(false); setPendingPath(null); }}
+                className="flex-1 px-3 py-2 rounded-lg text-xs text-editor-text-muted border border-editor-border hover:border-editor-text transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmOpen}
+                className="flex-1 px-3 py-2 rounded-lg text-xs font-semibold bg-editor-accent hover:bg-editor-accent-hover transition-colors"
+              >
+                Transcribe
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

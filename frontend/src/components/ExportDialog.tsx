@@ -46,7 +46,10 @@ export default function ExportDialog() {
           input_path: videoPath,
           output_path: outputPath,
           keep_segments: keepSegments,
-          words: options.captions !== 'none' ? words : undefined,
+          // Always send words — the export refiner uses them to rebuild the
+          // AcousticMap on demand if the spectral cache was cleared since
+          // transcription. Captions still gate inclusion of deleted_indices.
+          words,
           deleted_indices: options.captions !== 'none' ? [...deletedSet] : undefined,
           ...options,
         }),
