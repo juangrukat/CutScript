@@ -143,6 +143,12 @@ Five preset buttons: Remove repetition, Tighten pace, Keep key points, Q&A only,
 
 - New IPC: `dialog:openDirectory` (used by the clip save-location picker).
 
+### Transcription: MLX backend option
+
+- **New**: `backend/services/transcription_mlx.py` — Apple Silicon decode via `mlx-whisper`. Returns segment-level text that the shared `_align_and_pack()` helper feeds into WhisperX's wav2vec2 forced alignment. Timestamps are as precise as the WhisperX path.
+- **New endpoint**: `GET /transcribe/backends` — probes which backends the machine can run (platform + import check) so the UI can disable unavailable options.
+- **App.tsx**: backend selector on the open-file screen. Queries backends at load, auto-falls-back if the saved backend isn't available, and filters the model list per backend (`large-v3-turbo` is MLX-only; `distil-large-v3` is WhisperX-only).
+
 ---
 
 ## Legacy / fallback refiner
@@ -208,7 +214,8 @@ cutscript/
 │   │   ├── ai_validator.py              # Pydantic models + validators (the truth layer)
 │   │   ├── audio_analyzer.py            # AcousticMap
 │   │   ├── boundary_refiner.py
-│   │   ├── transcription.py
+│   │   ├── transcription.py             # Backend dispatch + shared _align_and_pack()
+│   │   ├── transcription_mlx.py         # Lazy MLX decoder (Apple Silicon)
 │   │   └── video_editor.py
 │   └── utils/
 └── tests/waveform_analysis/             # phase0-phase5 diagnostic + validation scripts
