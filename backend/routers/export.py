@@ -9,7 +9,11 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from services.video_editor import export_stream_copy, export_reencode, export_reencode_with_subs
+from services.video_editor import (
+    export_stream_copy,
+    export_reencode,
+    export_reencode_with_subs,
+)
 from services.audio_cleaner import clean_audio
 from services.caption_generator import generate_srt, generate_ass, save_captions
 from services.boundary_refiner import BoundaryRefiner
@@ -57,6 +61,7 @@ def _gap_has_speech(y, sr: float, t0: float, t1: float, threshold: float) -> boo
     """
     import librosa
     import numpy as np
+
     gap = t1 - t0
     if gap <= 0:
         return False
@@ -79,6 +84,7 @@ def _snap_zc(y, sr: float, t: float, search_ms: float = 40.0) -> float:
     """Snap a timestamp to the nearest zero crossing within ±search_ms."""
     import librosa
     import numpy as np
+
     idx = int(t * sr)
     half = int(search_ms / 1000.0 * sr)
     start = max(0, idx - half)
@@ -89,10 +95,13 @@ def _snap_zc(y, sr: float, t: float, search_ms: float = 40.0) -> float:
     return float(zc_idx[np.argmin(np.abs(zc_idx - idx))]) / sr
 
 
-def _sample_has_speech(y, sr: float, t: float, threshold: float, window_ms: float = 15.0) -> bool:
+def _sample_has_speech(
+    y, sr: float, t: float, threshold: float, window_ms: float = 15.0
+) -> bool:
     """Check whether a point in time is inside active speech (±window_ms)."""
     import librosa
     import numpy as np
+
     half = int(window_ms / 1000.0 * sr)
     s = max(0, int(t * sr) - half)
     e = min(len(y), int(t * sr) + half)
@@ -105,7 +114,9 @@ def _sample_has_speech(y, sr: float, t: float, threshold: float, window_ms: floa
 _WORD_MARGIN_S = 0.028  # 28ms — typical WhisperX forced-alignment imprecision
 
 
-def _advance_past_silence(y, sr: float, t_start: float, t_cap: float, speech_threshold: float) -> float:
+def _advance_past_silence(
+    y, sr: float, t_start: float, t_cap: float, speech_threshold: float
+) -> float:
     """
     If t_start is in a silent zone, advance to the first sustained speech within
     [t_start, t_cap] and return 20ms before its acoustic onset.
@@ -167,9 +178,14 @@ def _advance_past_silence(y, sr: float, t_start: float, t_cap: float, speech_thr
     y2 = y[s2:e2]
     env = librosa.onset.onset_strength(y=y2, sr=sr)
     frames2 = librosa.onset.onset_detect(
-        onset_envelope=env, sr=sr,
-        pre_max=2, post_max=2, pre_avg=2, post_avg=5,
-        delta=0.03, wait=1,
+        onset_envelope=env,
+        sr=sr,
+        pre_max=2,
+        post_max=2,
+        pre_avg=2,
+        post_avg=5,
+        delta=0.03,
+        wait=1,
     )
     if len(frames2) == 0:
         return max(t_start, speech_t - 0.020)
@@ -183,7 +199,9 @@ def _advance_past_silence(y, sr: float, t_start: float, t_cap: float, speech_thr
     return max(t_start, onset_t - 0.020)
 
 
-def _find_onset_before(y, sr: float, t_whisper: float, prev_end: float) -> Optional[float]:
+def _find_onset_before(
+    y, sr: float, t_whisper: float, prev_end: float
+) -> Optional[float]:
     """
     Find the acoustic onset of the word whose WhisperX timestamp is t_whisper.
 
@@ -210,9 +228,14 @@ def _find_onset_before(y, sr: float, t_whisper: float, prev_end: float) -> Optio
     y_win = y[s:e]
     env = librosa.onset.onset_strength(y=y_win, sr=sr)
     frames = librosa.onset.onset_detect(
-        onset_envelope=env, sr=sr,
-        pre_max=2, post_max=2, pre_avg=2, post_avg=5,
-        delta=0.03, wait=1,
+        onset_envelope=env,
+        sr=sr,
+        pre_max=2,
+        post_max=2,
+        pre_avg=2,
+        post_avg=5,
+        delta=0.03,
+        wait=1,
     )
     if len(frames) == 0:
         return None
@@ -225,7 +248,9 @@ def _find_onset_before(y, sr: float, t_whisper: float, prev_end: float) -> Optio
     return float(candidates[-1])
 
 
-def _find_word_end(y, sr: float, t_whisper: float, next_start: float, speech_threshold: float) -> Optional[float]:
+def _find_word_end(
+    y, sr: float, t_whisper: float, next_start: float, speech_threshold: float
+) -> Optional[float]:
     """
     Find where the kept word's energy naturally ends after t_whisper.
 
@@ -259,25 +284,28 @@ def _find_word_end(y, sr: float, t_whisper: float, next_start: float, speech_thr
     # Phase 1: word-relative frame-power threshold
     hop = 64
     s_ref = max(0, int((t_whisper - 1.0) * sr))
-    y_ref = y[s_ref:max(s_ref + 256, int(t_whisper * sr))]
+    y_ref = y[s_ref : max(s_ref + 256, int(t_whisper * sr))]
     if len(y_ref) >= 256:
         rms_ref = librosa.feature.rms(y=y_ref, frame_length=256, hop_length=hop)[0]
-        word_peak_power = float(np.max(rms_ref ** 2))  # peak frame RMS²
+        word_peak_power = float(np.max(rms_ref**2))  # peak frame RMS²
         if word_peak_power > 1e-10:
             # −25 dB below word's voiced peak: captures fricatives, clears room noise
             threshold_power = word_peak_power * (10 ** (-25.0 / 10.0))
 
             y_fwd = y[s:e]
             rms_fwd = librosa.feature.rms(y=y_fwd, frame_length=256, hop_length=hop)[0]
-            rms_t = librosa.frames_to_time(np.arange(len(rms_fwd)), sr=sr, hop_length=hop) + t_whisper
+            rms_t = (
+                librosa.frames_to_time(np.arange(len(rms_fwd)), sr=sr, hop_length=hop)
+                + t_whisper
+            )
 
-            below = rms_fwd ** 2 < threshold_power
+            below = rms_fwd**2 < threshold_power
             for i in range(len(below) - 2):
                 if below[i] and below[i + 1] and below[i + 2]:
                     decay_t = float(rms_t[i])
                     if decay_t - t_whisper > 0.003:
-                        return decay_t   # word tail captured
-                    return None          # WhisperX already at decay → use fallback
+                        return decay_t  # word tail captured
+                    return None  # WhisperX already at decay → use fallback
 
     # Phase 2: energy never drops — deleted speech fills the gap immediately.
     # Find first onset of following content and cut 20ms before it.
@@ -285,9 +313,14 @@ def _find_word_end(y, sr: float, t_whisper: float, next_start: float, speech_thr
     if len(y_fwd2) >= 512:
         env = librosa.onset.onset_strength(y=y_fwd2, sr=sr)
         frames = librosa.onset.onset_detect(
-            onset_envelope=env, sr=sr,
-            pre_max=2, post_max=2, pre_avg=2, post_avg=5,
-            delta=0.03, wait=1,
+            onset_envelope=env,
+            sr=sr,
+            pre_max=2,
+            post_max=2,
+            pre_avg=2,
+            post_avg=5,
+            delta=0.03,
+            wait=1,
         )
         if len(frames) > 0:
             onsets_abs = librosa.frames_to_time(frames, sr=sr) + t_whisper
@@ -326,7 +359,7 @@ def _refine_from_map(segments: list, wav_path: str, acoustic_map: AcousticMap) -
     # This handles the "freedom." case where Whisper's `we` is ~20ms from EOF,
     # the nasal tail runs to file end, and both `ae` and `_snap_zc` can leave
     # the last few frames of audible content on the floor.
-    EOF_WINDOW_S = 0.100
+    EOF_WINDOW_S = 0.500
 
     # Precompute a coarse speech-threshold for the EOF tail check
     _rms_coarse = librosa.feature.rms(y=y, frame_length=1024, hop_length=256)[0]
@@ -340,39 +373,41 @@ def _refine_from_map(segments: list, wav_path: str, acoustic_map: AcousticMap) -
         end_word = acoustic_map.find_word_by_end(seg["end"], tolerance=TOL)
 
         prev_cap = segments[i - 1]["end"] if i > 0 else 0.0
-        is_last_seg = (i == len(segments) - 1)
+        is_last_seg = i == len(segments) - 1
         next_cap = segments[i + 1]["start"] if not is_last_seg else float("inf")
 
         if start_word is not None:
             refined_start = max(prev_cap, start_word.as_)
         if end_word is not None:
-            refined_end = min(next_cap - 0.005 if np.isfinite(next_cap) else end_word.ae,
-                              end_word.ae)
+            refined_end = min(
+                next_cap - 0.005 if np.isfinite(next_cap) else end_word.ae, end_word.ae
+            )
 
+        # Clamp to audio bounds so ffmpeg atrim can never produce an empty segment
         refined_start = _snap_zc(y, sr, refined_start)
 
-        # EOF guardrail for the final segment only: if we're already within
-        # EOF_WINDOW_S of audio end and audible energy exists in the remaining
-        # tail, clamp to audio_dur and skip backward ZC snap. Otherwise fall
-        # through to normal ZC snap. This is scoped narrowly so mid-stream
-        # segments and clean-ending last segments keep their existing behavior.
-        if is_last_seg and (audio_dur - refined_end) <= EOF_WINDOW_S:
-            tail_s = int(refined_end * sr)
-            tail_e = int(audio_dur * sr)
-            tail_rms = float(np.sqrt(np.mean(y[tail_s:tail_e] ** 2) + 1e-12)) if tail_e > tail_s else 0.0
-            if tail_rms > _speech_thr:
-                refined_end = audio_dur
-                logger.info(
-                    f"EOF guardrail extended last segment to audio_dur "
-                    f"(tail rms {tail_rms:.5f} > thr {_speech_thr:.5f})"
+        if is_last_seg:
+            # For last segment, skip zero-crossing snap to preserve content near EOF
+            # EOF guardrail for the final segment only: if we're already within
+            # EOF_WINDOW_S of audio end and audible energy exists in the remaining
+            # tail, clamp to audio_dur. Otherwise keep as is.
+            if (audio_dur - refined_end) <= EOF_WINDOW_S:
+                tail_s = int(refined_end * sr)
+                tail_e = int(audio_dur * sr)
+                tail_rms = (
+                    float(np.sqrt(np.mean(y[tail_s:tail_e] ** 2) + 1e-12))
+                    if tail_e > tail_s
+                    else 0.0
                 )
-            else:
-                # no audible tail — safe to ZC-snap, but never past EOF
-                refined_end = min(_snap_zc(y, sr, refined_end), audio_dur)
+                if tail_rms > _speech_thr:
+                    refined_end = audio_dur
+                    logger.info(
+                        f"EOF guardrail extended last segment to audio_dur "
+                        f"(tail rms {tail_rms:.5f} > thr {_speech_thr:.5f})"
+                    )
         else:
             refined_end = _snap_zc(y, sr, refined_end)
 
-        # Clamp to audio bounds so ffmpeg atrim can never produce an empty segment
         refined_start = max(0.0, min(refined_start, audio_dur))
         refined_end = max(0.0, min(refined_end, audio_dur))
         refined.append({"start": refined_start, "end": refined_end})
@@ -404,6 +439,7 @@ def _refine_segments(segments: list, wav_path: str, export_mode: str) -> list:
     try:
         import librosa
         import numpy as np
+
         y, sr = librosa.load(wav_path, sr=None, mono=True)
 
         global_rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=512)[0]
@@ -416,20 +452,28 @@ def _refine_segments(segments: list, wav_path: str, export_mode: str) -> list:
 
         for i, seg in enumerate(segments):
             prev_end = segments[i - 1]["end"] if i > 0 else 0.0
-            next_start = segments[i + 1]["start"] if i < len(segments) - 1 else seg["end"] + 2.0
+            next_start = (
+                segments[i + 1]["start"] if i < len(segments) - 1 else seg["end"] + 2.0
+            )
 
             # Check the interior of each gap.  Edge-adjacent word energy is
             # excluded by the margin in _gap_has_speech, so only actual deleted
             # speech (or a full silence) is reported here.
-            speech_in_end_gap = _gap_has_speech(y, sr, seg["end"], next_start, speech_threshold)
-            speech_in_start_gap = _gap_has_speech(y, sr, prev_end, seg["start"], speech_threshold)
+            speech_in_end_gap = _gap_has_speech(
+                y, sr, seg["end"], next_start, speech_threshold
+            )
+            speech_in_start_gap = _gap_has_speech(
+                y, sr, prev_end, seg["start"], speech_threshold
+            )
 
             # Onset-guided boundary for word-level cuts; fixed bias as fallback.
             refined_end = seg["end"]
             refined_start = seg["start"]
 
             if speech_in_end_gap:
-                word_end = _find_word_end(y, sr, seg["end"], next_start, speech_threshold)
+                word_end = _find_word_end(
+                    y, sr, seg["end"], next_start, speech_threshold
+                )
                 if word_end is not None:
                     refined_end = _snap_zc(y, sr, word_end)
                 else:
@@ -448,7 +492,9 @@ def _refine_segments(segments: list, wav_path: str, export_mode: str) -> list:
                     # Back up 20ms before the onset to include the attack transient.
                     # Capped at 80ms before WhisperX to prevent runaway detection;
                     # clamped forward so we never start inside the previous segment.
-                    pre_onset = max(prev_end + 0.005, onset - 0.020, seg["start"] - 0.080)
+                    pre_onset = max(
+                        prev_end + 0.005, onset - 0.020, seg["start"] - 0.080
+                    )
                     refined_start = _snap_zc(y, sr, pre_onset)
                 else:
                     # Fallback: fixed outward bias + ZC snap (original behavior)
@@ -462,11 +508,20 @@ def _refine_segments(segments: list, wav_path: str, export_mode: str) -> list:
 
             # For silence-bordered sides, use BoundaryRefiner
             if not speech_in_end_gap or not speech_in_start_gap:
-                start_window_pre = 0.0 if speech_in_start_gap else min(0.5, max(0.0, seg["start"] - prev_end))
-                end_window_post = 0.0 if speech_in_end_gap else min(0.7, max(0.0, next_start - seg["end"]))
+                start_window_pre = (
+                    0.0
+                    if speech_in_start_gap
+                    else min(0.5, max(0.0, seg["start"] - prev_end))
+                )
+                end_window_post = (
+                    0.0
+                    if speech_in_end_gap
+                    else min(0.7, max(0.0, next_start - seg["end"]))
+                )
 
                 result = refiner.refine_boundaries(
-                    y=y, sr=sr,
+                    y=y,
+                    sr=sr,
                     approx_start=seg["start"],
                     approx_end=seg["end"],
                     mode=boundary_mode,
@@ -487,7 +542,11 @@ def _refine_segments(segments: list, wav_path: str, export_mode: str) -> list:
             # last deleted word rather than at the kept word itself — leaving
             # up to 1-2s of near-silence that _find_onset_before can't bridge.
             refined_start = _advance_past_silence(
-                y, sr, refined_start, min(seg["end"], refined_start + 2.0), speech_threshold
+                y,
+                sr,
+                refined_start,
+                min(seg["end"], refined_start + 2.0),
+                speech_threshold,
             )
 
             refined.append({"start": refined_start, "end": refined_end})
@@ -510,7 +569,9 @@ def _refine_segments(segments: list, wav_path: str, export_mode: str) -> list:
                 f"Dropped {len(refined) - len(kept)} degenerate segment(s) during refinement"
             )
 
-        logger.info(f"Boundary refinement applied ({boundary_mode} mode) to {len(kept)} segments")
+        logger.info(
+            f"Boundary refinement applied ({boundary_mode} mode) to {len(kept)} segments"
+        )
         return kept
     except Exception as e:
         logger.warning(f"Boundary refinement failed, using original timestamps: {e}")
@@ -520,13 +581,20 @@ def _refine_segments(segments: list, wav_path: str, export_mode: str) -> list:
 def _mux_audio(video_path: str, audio_path: str, output_path: str) -> str:
     """Replace video's audio track with cleaned audio using FFmpeg."""
     import subprocess
+
     cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        "-c:v",
+        "copy",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
         "-shortest",
         output_path,
     ]
@@ -558,7 +626,9 @@ async def export_video(req: ExportRequest):
         ass_path = None
         if req.captions == "burn-in" and words_dicts:
             ass_content = generate_ass(words_dicts, deleted_set)
-            tmp = tempfile.NamedTemporaryFile(suffix=".ass", delete=False, mode="w", encoding="utf-8")
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".ass", delete=False, mode="w", encoding="utf-8"
+            )
             tmp.write(ass_content)
             tmp.close()
             ass_path = tmp.name

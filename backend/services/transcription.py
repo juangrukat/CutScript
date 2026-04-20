@@ -23,6 +23,7 @@ def _make_cache_op(backend: str, beam_size: int, vad_filter: bool, vad_min_silen
     WhisperX decodes never collide in cache.
     """
     settings = {
+        "transcription_version": 3,
         "backend": backend,
         "condition_on_previous_text": False,
         "temperature": 0.0,
@@ -46,6 +47,8 @@ from utils.cache import load_from_cache, save_to_cache
 logger = logging.getLogger(__name__)
 
 _model_cache: dict = {}
+_SEG_END_PAD_S = 0.400
+_TAIL_RESCUE_WINDOW_S = 2.0
 
 try:
     import whisperx
@@ -388,10 +391,152 @@ def _transcribe_whisperx(
     if not verbatim:
         segments_for_align = _deduplicate_segments(segments_for_align)
 
+    segments_for_align = _rescue_tail_segment_text(
+        model=model,
+        audio=audio,
+        segments_for_align=segments_for_align,
+        total_duration=total_duration,
+        transcribe_opts=transcribe_opts,
+    )
+
+    segments_for_align = _pad_segment_ends_for_alignment(
+        segments_for_align,
+        total_duration,
+    )
+
     return _align_and_pack(
         segments_for_align, audio, detected_language,
         device=device, verbatim=verbatim, progress_cb=progress_cb,
     )
+
+
+def _pad_segment_ends_for_alignment(
+    segments_for_align: list,
+    audio_duration: Optional[float],
+) -> list:
+    """
+    Extend decoder segment ends so WhisperX alignment has room to place the
+    last word boundary on the real acoustic decay rather than the decoder's
+    token-quantized segment end.
+
+    Without this, the last word of a segment can be clipped at the final voiced
+    phoneme ("free" instead of "freedom"), especially near EOF or when the
+    segment end lands on a rising/falling intonation contour.
+    """
+    if not segments_for_align:
+        return segments_for_align
+
+    padded = [dict(seg) for seg in segments_for_align]
+    for i in range(len(padded) - 1):
+        next_start = float(padded[i + 1]["start"])
+        padded[i]["end"] = min(float(padded[i]["end"]) + _SEG_END_PAD_S, next_start)
+
+    if audio_duration is not None:
+        padded[-1]["end"] = min(
+            max(float(padded[-1]["end"]), float(audio_duration)),
+            float(audio_duration),
+        )
+
+    return padded
+
+
+def _norm_token(token: str) -> str:
+    import re
+
+    return re.sub(r"[^\w']+", "", token.lower())
+
+
+def _rescue_tail_segment_text(
+    model,
+    audio,
+    segments_for_align: list,
+    total_duration: float,
+    transcribe_opts: dict,
+) -> list:
+    """
+    Re-decode the last ~2 seconds and use it to repair the final segment text.
+
+    The full-file decoder can collapse the final word at EOF ("freedom" -> "free")
+    even when the acoustic tail is present. A focused tail decode consistently
+    recovers the full word on those same files. If the tail decode finds a longer,
+    better-matching ending, splice that text into the final segment before
+    WhisperX alignment runs.
+    """
+    if not segments_for_align:
+        return segments_for_align
+
+    last_seg = segments_for_align[-1]
+    if float(last_seg.get("end", 0.0)) < total_duration - 0.25:
+        return segments_for_align
+
+    sr = 16000
+    tail_start = max(0.0, total_duration - _TAIL_RESCUE_WINDOW_S)
+    start_idx = max(0, int(tail_start * sr))
+    tail_audio = audio[start_idx:]
+    if len(tail_audio) < int(0.5 * sr):
+        return segments_for_align
+
+    rescue_opts = dict(transcribe_opts)
+    rescue_opts["beam_size"] = max(int(transcribe_opts.get("beam_size", 5)), 10)
+    rescue_opts["no_speech_threshold"] = 0.6
+    rescue_opts["compression_ratio_threshold"] = 2.4
+
+    try:
+        tail_gen, _ = model.model.transcribe(tail_audio, **rescue_opts)
+        tail_segments = [{"text": seg.text} for seg in tail_gen if seg.text.strip()]
+    except Exception as e:
+        logger.debug(f"Tail rescue decode failed: {e}")
+        return segments_for_align
+
+    if not tail_segments:
+        return segments_for_align
+
+    current_words = str(last_seg.get("text", "")).split()
+    rescue_words = tail_segments[-1]["text"].split()
+    if len(current_words) < 2 or len(rescue_words) < 2:
+        return segments_for_align
+
+    current_last = _norm_token(current_words[-1])
+    rescue_last = _norm_token(rescue_words[-1])
+    if not current_last or not rescue_last:
+        return segments_for_align
+    if rescue_last == current_last:
+        return segments_for_align
+    if not rescue_last.startswith(current_last):
+        return segments_for_align
+    if len(rescue_last) <= len(current_last):
+        return segments_for_align
+
+    max_anchor = min(len(current_words) - 1, len(rescue_words))
+    best = None
+    for k in range(max_anchor, 1, -1):
+        anchor = [_norm_token(w) for w in current_words[-(k + 1) : -1]]
+        if not all(anchor):
+            continue
+        for j in range(len(rescue_words) - k + 1):
+            candidate = [_norm_token(w) for w in rescue_words[j : j + k]]
+            if candidate == anchor:
+                best = (k, j)
+                break
+        if best is not None:
+            break
+
+    if best is None:
+        return segments_for_align
+
+    k, j = best
+    merged_words = current_words[: -(k + 1)] + rescue_words[j:]
+    merged_text = " ".join(merged_words)
+    if merged_text == last_seg.get("text", ""):
+        return segments_for_align
+
+    logger.info(
+        "Tail rescue updated final segment text: "
+        f"'{last_seg.get('text', '').strip()}' -> '{merged_text.strip()}'"
+    )
+    repaired = [dict(seg) for seg in segments_for_align]
+    repaired[-1]["text"] = merged_text
+    return repaired
 
 
 def _align_and_pack(
@@ -513,20 +658,8 @@ def _transcribe_mlx_with_align(
     if not verbatim:
         segments_for_align = _deduplicate_segments(segments_for_align)
 
-    # MLX (like Whisper) emits segment end timestamps quantized to 20ms tokens
-    # that typically land at the last decoded phoneme — NOT at the end of the
-    # word's acoustic decay (fricative tail, stop release, nasal murmur).
-    # whisperx.align clamps every segment's last word end to the segment end,
-    # so without padding, every segment boundary clips its final word's tail
-    # and the final word of the video is cut at its phoneme instead of its
-    # true acoustic end.
-    #
-    # Pad each segment's end forward to give the aligner room to land the word
-    # boundary on the real decay point. Inter-segment extensions stop at the
-    # next segment's reported start so alignment never crosses into the next
-    # segment's first onset. The last segment extends all the way to the
-    # preprocessed audio duration so the final coda isn't capped short.
-    _SEG_END_PAD_S = 0.400
+    # MLX emits token-quantized segment ends just like faster-whisper, so it
+    # needs the same end-padding before WhisperX alignment as the standard path.
     _audio_dur = None
     try:
         import soundfile as sf
@@ -535,17 +668,10 @@ def _transcribe_mlx_with_align(
     except Exception:
         _audio_dur = None
 
-    for i in range(len(segments_for_align) - 1):
-        next_start = segments_for_align[i + 1]["start"]
-        segments_for_align[i]["end"] = min(
-            segments_for_align[i]["end"] + _SEG_END_PAD_S,
-            next_start,
-        )
-    if segments_for_align and _audio_dur is not None:
-        segments_for_align[-1]["end"] = min(
-            max(segments_for_align[-1]["end"], _audio_dur),
-            _audio_dur,
-        )
+    segments_for_align = _pad_segment_ends_for_alignment(
+        segments_for_align,
+        _audio_dur,
+    )
 
     audio = whisperx.load_audio(audio_path)
     return _align_and_pack(

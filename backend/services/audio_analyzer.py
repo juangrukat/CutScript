@@ -41,6 +41,15 @@ from utils.cache import get_file_hash
 logger = logging.getLogger(__name__)
 
 SPECTRAL_CACHE_DIR = Path.home() / ".cutscript_spectral_cache"
+# v5: Tail-only transcript rescue can repair truncated final words at EOF
+# before alignment ("free" -> "freedom"). Acoustic maps built from earlier
+# transcripts preserve the wrong final-word text/coda class, so force rebuilds.
+#
+# v4: Transcript alignment now pads decoder segment ends before WhisperX
+# alignment in both decode paths. Acoustic maps built from older transcripts can
+# preserve under-aligned final-word boundaries, so bump the map version to force
+# a rebuild from the updated word timings.
+#
 # v3: Additional EOF fix — when Whisper's `we` for the last word lands within
 # ~20ms of audio EOF, the tail window is too short (≤3 frames at hop=256,
 # sr=48000) to run the decay analysis, so the `if len(la_idx) > 3` guard
@@ -48,7 +57,7 @@ SPECTRAL_CACHE_DIR = Path.home() / ".cutscript_spectral_cache"
 # last word's `ae` to `lookahead_end` (the EOF cap) instead of `we`, so short
 # tail windows still extend to EOF. Without this, v2 caches show `ae == we`
 # for words like "freedom." and the final 20ms of nasal tail gets clipped.
-_MAP_VERSION = 3
+_MAP_VERSION = 5
 
 # Short-horizon window for all detection work. Matches _find_word_end's old cap,
 # but extended to 500ms for coda search because a /ʃ/ fricative can trail ~300ms
@@ -117,13 +126,13 @@ class WordFingerprint:
     text: str
     ws: float
     we: float
-    as_: float   # acoustic start (stored as "as" in JSON — "as" is a Python keyword)
-    ae: float    # acoustic end
+    as_: float  # acoustic start (stored as "as" in JSON — "as" is a Python keyword)
+    ae: float  # acoustic end
     onset: str
     coda: str
     peak_rms: float
     peak_fric: float
-    dips: list   # list of [t_sec, db_below_peak]
+    dips: list  # list of [t_sec, db_below_peak]
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -133,11 +142,16 @@ class WordFingerprint:
     @classmethod
     def from_dict(cls, d: dict) -> "WordFingerprint":
         return cls(
-            i=d["i"], text=d["text"],
-            ws=d["ws"], we=d["we"],
-            as_=d.get("as", d["ws"]), ae=d.get("ae", d["we"]),
-            onset=d.get("onset", "vowel"), coda=d.get("coda", "vowel"),
-            peak_rms=d.get("peak_rms", 0.0), peak_fric=d.get("peak_fric", 0.0),
+            i=d["i"],
+            text=d["text"],
+            ws=d["ws"],
+            we=d["we"],
+            as_=d.get("as", d["ws"]),
+            ae=d.get("ae", d["we"]),
+            onset=d.get("onset", "vowel"),
+            coda=d.get("coda", "vowel"),
+            peak_rms=d.get("peak_rms", 0.0),
+            peak_fric=d.get("peak_fric", 0.0),
             dips=d.get("dips", []),
         )
 
@@ -178,7 +192,9 @@ class AcousticMap:
             words=[WordFingerprint.from_dict(w) for w in d["words"]],
         )
 
-    def find_word_by_end(self, t: float, tolerance: float = 0.05) -> Optional[WordFingerprint]:
+    def find_word_by_end(
+        self, t: float, tolerance: float = 0.05
+    ) -> Optional[WordFingerprint]:
         """Return the word whose whisper end (we) is closest to t, within tolerance."""
         best = None
         best_d = tolerance
@@ -189,7 +205,9 @@ class AcousticMap:
                 best_d = d
         return best
 
-    def find_word_by_start(self, t: float, tolerance: float = 0.05) -> Optional[WordFingerprint]:
+    def find_word_by_start(
+        self, t: float, tolerance: float = 0.05
+    ) -> Optional[WordFingerprint]:
         """Return the word whose whisper start (ws) is closest to t, within tolerance."""
         best = None
         best_d = tolerance
@@ -246,9 +264,17 @@ def _fricative_band_rms(y, sr: int, frame_length: int = 1024, hop_length: int = 
 
 
 def _analyze_word(
-    y, sr: int, word: dict, next_ws: float, prev_we: float,
-    speech_threshold: float, fric_threshold_floor: float,
-    rms_full, rms_full_t, band_rms, band_rms_t,
+    y,
+    sr: int,
+    word: dict,
+    next_ws: float,
+    prev_we: float,
+    speech_threshold: float,
+    fric_threshold_floor: float,
+    rms_full,
+    rms_full_t,
+    band_rms,
+    band_rms_t,
     hop_length: int,
     is_last: bool = False,
 ) -> WordFingerprint:
@@ -271,7 +297,11 @@ def _analyze_word(
     peak_rms = float(np.max(rms_full[interior_idx])) if len(interior_idx) > 0 else 0.0
 
     band_interior_idx = _slice_at(band_rms_t, ws, we)
-    peak_fric = float(np.max(band_rms[band_interior_idx])) if len(band_interior_idx) > 0 else 0.0
+    peak_fric = (
+        float(np.max(band_rms[band_interior_idx]))
+        if len(band_interior_idx) > 0
+        else 0.0
+    )
 
     # ---- acoustic start (as_): look back up to 200ms for the onset transient.
     as_ = ws
@@ -304,10 +334,7 @@ def _analyze_word(
     # leave a hardcoded hole at the end of the video, so we let the cap run
     # all the way to the audio end (EOF is its own natural boundary).
     if is_last:
-        lookahead_end = min(
-            len(y) / sr,
-            we + _CODA_SEARCH_MS / 1000.0,
-        )
+        lookahead_end = len(y) / sr
     else:
         lookahead_end = min(
             len(y) / sr,
@@ -339,8 +366,14 @@ def _analyze_word(
             L = min(len(below_band), len(below_bb))
             found = None
             for k in range(L - 2):
-                if below_band[k] and below_band[k + 1] and below_band[k + 2] \
-                   and below_bb[k] and below_bb[k + 1] and below_bb[k + 2]:
+                if (
+                    below_band[k]
+                    and below_band[k + 1]
+                    and below_band[k + 2]
+                    and below_bb[k]
+                    and below_bb[k + 1]
+                    and below_bb[k + 2]
+                ):
                     found = k
                     break
             if found is not None:
@@ -353,7 +386,7 @@ def _analyze_word(
             # for nasals give a bit more slack because nasal murmur decays gently
             if coda == "nasal":
                 db_target = -18.0
-            thr_power = (peak_rms ** 2) * (10 ** (db_target / 10.0))
+            thr_power = (peak_rms**2) * (10 ** (db_target / 10.0))
             pow_la = rms_full[la_idx] ** 2
             below = pow_la < thr_power
             found = None
@@ -383,23 +416,28 @@ def _analyze_word(
     if len(dip_idx) > 0 and peak_rms > 1e-6:
         word_rms = rms_full[dip_idx]
         word_t = rms_full_t[dip_idx]
-        peak_power = peak_rms ** 2
+        peak_power = peak_rms**2
         dip_threshold = peak_power * (10 ** (-10.0 / 10.0))
-        local_powers = word_rms ** 2
+        local_powers = word_rms**2
         # Find local minima below the dip threshold
         for k in range(1, len(local_powers) - 1):
-            if (local_powers[k] < dip_threshold and
-                local_powers[k] <= local_powers[k - 1] and
-                local_powers[k] <= local_powers[k + 1]):
+            if (
+                local_powers[k] < dip_threshold
+                and local_powers[k] <= local_powers[k - 1]
+                and local_powers[k] <= local_powers[k + 1]
+            ):
                 db = 10.0 * float(np.log10(max(local_powers[k], 1e-12) / peak_power))
                 dips.append([round(float(word_t[k]), 4), round(db, 2)])
 
     return WordFingerprint(
         i=int(word.get("_index", 0)),
         text=text,
-        ws=round(ws, 4), we=round(we, 4),
-        as_=round(as_, 4), ae=round(ae, 4),
-        onset=onset, coda=coda,
+        ws=round(ws, 4),
+        we=round(we, 4),
+        as_=round(as_, 4),
+        ae=round(ae, 4),
+        onset=onset,
+        coda=coda,
         peak_rms=round(peak_rms, 6),
         peak_fric=round(peak_fric, 6),
         dips=dips,
@@ -448,6 +486,7 @@ def analyze_file(
     video_ext = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     if file_path.suffix.lower() in video_ext:
         from utils.audio_processing import extract_audio
+
         wav_path = extract_audio(file_path)
     else:
         wav_path = file_path
@@ -459,15 +498,23 @@ def analyze_file(
     # Global noise floors
     hop_length = 256
     frame_length = 1024
-    rms_full = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
-    rms_full_t = librosa.frames_to_time(np.arange(len(rms_full)), sr=sr, hop_length=hop_length)
+    rms_full = librosa.feature.rms(
+        y=y, frame_length=frame_length, hop_length=hop_length
+    )[0]
+    rms_full_t = librosa.frames_to_time(
+        np.arange(len(rms_full)), sr=sr, hop_length=hop_length
+    )
 
     noise_floor_rms = float(np.percentile(rms_full, 10)) + 1e-8
     speech_threshold = noise_floor_rms * 6.0
 
     _p(40, "Computing fricative band...")
-    band_rms = _fricative_band_rms(y, sr, frame_length=frame_length, hop_length=hop_length)
-    band_rms_t = librosa.frames_to_time(np.arange(len(band_rms)), sr=sr, hop_length=hop_length)
+    band_rms = _fricative_band_rms(
+        y, sr, frame_length=frame_length, hop_length=hop_length
+    )
+    band_rms_t = librosa.frames_to_time(
+        np.arange(len(band_rms)), sr=sr, hop_length=hop_length
+    )
     fricative_noise_floor = float(np.percentile(band_rms, 10)) + 1e-10
 
     _p(55, "Fingerprinting words...")
@@ -478,12 +525,17 @@ def analyze_file(
         prev_we = float(words[i - 1]["end"]) if i > 0 else 0.0
         next_ws = float(words[i + 1]["start"]) if i < N - 1 else duration
         fp = _analyze_word(
-            y, sr, w_with_idx,
-            next_ws=next_ws, prev_we=prev_we,
+            y,
+            sr,
+            w_with_idx,
+            next_ws=next_ws,
+            prev_we=prev_we,
             speech_threshold=speech_threshold,
             fric_threshold_floor=fricative_noise_floor,
-            rms_full=rms_full, rms_full_t=rms_full_t,
-            band_rms=band_rms, band_rms_t=band_rms_t,
+            rms_full=rms_full,
+            rms_full_t=rms_full_t,
+            band_rms=band_rms,
+            band_rms_t=band_rms_t,
             hop_length=hop_length,
             is_last=(i == N - 1),
         )
