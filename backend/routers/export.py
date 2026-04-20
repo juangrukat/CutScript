@@ -319,6 +319,18 @@ def _refine_from_map(segments: list, wav_path: str, acoustic_map: AcousticMap) -
     refined = []
 
     TOL = 0.100
+    # EOF guardrail: if the last segment's refined_end lands within this window
+    # of audio_dur AND there is still audible tail energy between refined_end
+    # and EOF, extend to audio_dur. Normal zero-crossing snapping is bypassed
+    # for that endpoint so it cannot pull the boundary backward into the tail.
+    # This handles the "freedom." case where Whisper's `we` is ~20ms from EOF,
+    # the nasal tail runs to file end, and both `ae` and `_snap_zc` can leave
+    # the last few frames of audible content on the floor.
+    EOF_WINDOW_S = 0.100
+
+    # Precompute a coarse speech-threshold for the EOF tail check
+    _rms_coarse = librosa.feature.rms(y=y, frame_length=1024, hop_length=256)[0]
+    _speech_thr = (float(np.percentile(_rms_coarse, 10)) + 1e-8) * 3.0
 
     for i, seg in enumerate(segments):
         refined_start = max(0.0, min(seg["start"], audio_dur))
@@ -328,7 +340,8 @@ def _refine_from_map(segments: list, wav_path: str, acoustic_map: AcousticMap) -
         end_word = acoustic_map.find_word_by_end(seg["end"], tolerance=TOL)
 
         prev_cap = segments[i - 1]["end"] if i > 0 else 0.0
-        next_cap = segments[i + 1]["start"] if i < len(segments) - 1 else float("inf")
+        is_last_seg = (i == len(segments) - 1)
+        next_cap = segments[i + 1]["start"] if not is_last_seg else float("inf")
 
         if start_word is not None:
             refined_start = max(prev_cap, start_word.as_)
@@ -337,7 +350,28 @@ def _refine_from_map(segments: list, wav_path: str, acoustic_map: AcousticMap) -
                               end_word.ae)
 
         refined_start = _snap_zc(y, sr, refined_start)
-        refined_end = _snap_zc(y, sr, refined_end)
+
+        # EOF guardrail for the final segment only: if we're already within
+        # EOF_WINDOW_S of audio end and audible energy exists in the remaining
+        # tail, clamp to audio_dur and skip backward ZC snap. Otherwise fall
+        # through to normal ZC snap. This is scoped narrowly so mid-stream
+        # segments and clean-ending last segments keep their existing behavior.
+        if is_last_seg and (audio_dur - refined_end) <= EOF_WINDOW_S:
+            tail_s = int(refined_end * sr)
+            tail_e = int(audio_dur * sr)
+            tail_rms = float(np.sqrt(np.mean(y[tail_s:tail_e] ** 2) + 1e-12)) if tail_e > tail_s else 0.0
+            if tail_rms > _speech_thr:
+                refined_end = audio_dur
+                logger.info(
+                    f"EOF guardrail extended last segment to audio_dur "
+                    f"(tail rms {tail_rms:.5f} > thr {_speech_thr:.5f})"
+                )
+            else:
+                # no audible tail — safe to ZC-snap, but never past EOF
+                refined_end = min(_snap_zc(y, sr, refined_end), audio_dur)
+        else:
+            refined_end = _snap_zc(y, sr, refined_end)
+
         # Clamp to audio bounds so ffmpeg atrim can never produce an empty segment
         refined_start = max(0.0, min(refined_start, audio_dur))
         refined_end = max(0.0, min(refined_end, audio_dur))

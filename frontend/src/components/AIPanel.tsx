@@ -154,9 +154,15 @@ export default function AIPanel() {
   }, [effectiveSaveDir, setClipSaveLocation]);
 
   function buildClipFilename(clip: ClipSuggestion, bucketIndex: number): string {
-    // {original-basename}_{duration}s_{n}.mp4  — e.g. a_30s_1.mp4
-    const safe = sourceBasename.replace(/[/\\:*?"<>|]/g, '_').substring(0, 60);
-    return `${safe}_${clip.target_duration}s_${bucketIndex}.mp4`;
+    const safeBase = sourceBasename.replace(/[/\\:*?"<>|]/g, '_').substring(0, 40);
+    const safeTitle = (clip.title || '')
+      .replace(/[/\\:*?"<>|]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .substring(0, 50);
+    return safeTitle
+      ? `${safeBase}_${clip.target_duration}s_${safeTitle}_${bucketIndex}.mp4`
+      : `${safeBase}_${clip.target_duration}s_${bucketIndex}.mp4`;
   }
 
   const checkReady = useCallback((): boolean => {

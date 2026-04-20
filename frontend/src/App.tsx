@@ -7,6 +7,7 @@ import AIPanel from './components/AIPanel';
 import ExportDialog from './components/ExportDialog';
 import SettingsPanel from './components/SettingsPanel';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
+import { useAIStore } from './store/aiStore';
 import {
   Film,
   FolderOpen,
@@ -35,6 +36,7 @@ export default function App() {
     setTranscribing,
     backendUrl,
   } = useEditorStore();
+  const clearAIResults = useAIStore((s) => s.clearResults);
 
   const WHISPERX_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3', 'distil-large-v3'] as const;
   const MLX_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'] as const;
@@ -145,12 +147,14 @@ export default function App() {
         setPendingPath(path);
         setShowOpenSettings(true);
       } else {
+        clearAIResults();
         loadVideo(path);
         await transcribeVideo(path);
       }
     } else {
       const path = manualPath.trim();
       if (path) {
+        clearAIResults();
         loadVideo(path);
         await transcribeVideo(path);
       }
@@ -162,6 +166,7 @@ export default function App() {
     setShowOpenSettings(false);
     const path = pendingPath;
     setPendingPath(null);
+    clearAIResults();
     loadVideo(path);
     await transcribeVideo(path);
   };
@@ -170,6 +175,7 @@ export default function App() {
     e.preventDefault();
     const path = manualPath.trim();
     if (!path) return;
+    clearAIResults();
     loadVideo(path);
     await transcribeVideo(path);
   };

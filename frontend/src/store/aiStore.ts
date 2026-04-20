@@ -38,6 +38,7 @@ interface AIActions {
   setClipSaveLocation: (location: string | null) => void;
   setFocusPlan: (plan: FocusPlan | null) => void;
   setProcessing: (active: boolean, message?: string) => void;
+  clearResults: () => void;
   hydrateKeys: () => Promise<void>;
 }
 
@@ -114,6 +115,8 @@ export const useAIStore = create<AIState & AIActions>()(
       setFocusPlan: (plan) => set({ focusPlan: plan }),
       setProcessing: (active, message) =>
         set({ isProcessing: active, processingMessage: message ?? '' }),
+      clearResults: () =>
+        set({ fillerResult: null, clipSuggestions: [], clipRationale: '', clipWarnings: [], focusPlan: null }),
 
       hydrateKeys: async () => {
         const [openaiKey, claudeKey] = await Promise.all([

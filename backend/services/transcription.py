@@ -513,6 +513,40 @@ def _transcribe_mlx_with_align(
     if not verbatim:
         segments_for_align = _deduplicate_segments(segments_for_align)
 
+    # MLX (like Whisper) emits segment end timestamps quantized to 20ms tokens
+    # that typically land at the last decoded phoneme — NOT at the end of the
+    # word's acoustic decay (fricative tail, stop release, nasal murmur).
+    # whisperx.align clamps every segment's last word end to the segment end,
+    # so without padding, every segment boundary clips its final word's tail
+    # and the final word of the video is cut at its phoneme instead of its
+    # true acoustic end.
+    #
+    # Pad each segment's end forward to give the aligner room to land the word
+    # boundary on the real decay point. Inter-segment extensions stop at the
+    # next segment's reported start so alignment never crosses into the next
+    # segment's first onset. The last segment extends all the way to the
+    # preprocessed audio duration so the final coda isn't capped short.
+    _SEG_END_PAD_S = 0.400
+    _audio_dur = None
+    try:
+        import soundfile as sf
+        with sf.SoundFile(audio_path) as _af:
+            _audio_dur = len(_af) / _af.samplerate
+    except Exception:
+        _audio_dur = None
+
+    for i in range(len(segments_for_align) - 1):
+        next_start = segments_for_align[i + 1]["start"]
+        segments_for_align[i]["end"] = min(
+            segments_for_align[i]["end"] + _SEG_END_PAD_S,
+            next_start,
+        )
+    if segments_for_align and _audio_dur is not None:
+        segments_for_align[-1]["end"] = min(
+            max(segments_for_align[-1]["end"], _audio_dur),
+            _audio_dur,
+        )
+
     audio = whisperx.load_audio(audio_path)
     return _align_and_pack(
         segments_for_align, audio, detected_language,

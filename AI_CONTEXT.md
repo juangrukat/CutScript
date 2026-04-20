@@ -63,6 +63,8 @@ Built at ingest time by `POST /analyze` and consumed at export time by `_refine_
 
 **Coda-specific decay policies** in `_refine_from_map` control how far `ae` extends past `we`: fricative tails get band+broadband both-below; nasals/stops/vowels use tiered dB thresholds (-18/-20/-25). Clamps to audio duration; drops any segment <10 ms.
 
+**Last-word special case (end-of-video fix).** The coda search cap is normally `next_ws - 5ms` — a guard that stops `ae` crossing into the next word's onset and, historically, prevented zero/negative-duration segments downstream. For the *final* word of the audio there is no next word, so the 5ms guard only carves out a hardcoded hole at EOF. `_analyze_word` now takes an `is_last` flag: when true, `lookahead_end` drops the `next_ws - 0.005` term and, for non-fricative codas where the decay threshold is never met inside the search window, `ae` is set to the cap instead of staying at `we`. Together these changes let the final word's tail run all the way to the audio end instead of getting trimmed by (up to) the coda search window. Mid-stream words keep the guard.
+
 Legacy `_refine_segments` kept only as a fallback (same safety clamps).
 
 ---
@@ -105,7 +107,7 @@ This applies to filler, clips, and focus alike. If the user wants to analyze the
 
 ### Clip exports
 
-- Filename format: `{source_basename}_{target_duration}s_{bucket_index}.mp4` (e.g. `a_30s_1.mp4`). Index is per-duration so multiple 30 s clips don't collide with each other.
+- Filename format: `{source_basename}_{target_duration}s_{clip_title}_{bucket_index}.mp4` (e.g. `interview_30s_How_We_Built_It_1.mp4`). Title is sanitized (spaces→underscores, illegal chars stripped, ≤50 chars). Index is per-duration so multiple clips of the same duration don't collide.
 - Save location: defaults to the source video's folder; user can override via a persisted picker (`dialog:openDirectory` IPC in Electron).
 - At export, `handleExportClip` intersects the clip's time range with the editor's current `getKeepSegments()` so any in-editor edits (fillers, focus cuts) are honoured, then calls `/export` with the full `words` payload + `deleted_indices`. That's what pipes the clip through the "regular route" — same AcousticMap refinement as a main-dialog export.
 - "Edit" button stages a clip into the editor (deletes everything outside the clip range) so the user can tweak before exporting through the main dialog.
@@ -148,6 +150,8 @@ Five preset buttons: Remove repetition, Tighten pace, Keep key points, Q&A only,
 - **New**: `backend/services/transcription_mlx.py` — Apple Silicon decode via `mlx-whisper`. Returns segment-level text that the shared `_align_and_pack()` helper feeds into WhisperX's wav2vec2 forced alignment. Timestamps are as precise as the WhisperX path.
 - **New endpoint**: `GET /transcribe/backends` — probes which backends the machine can run (platform + import check) so the UI can disable unavailable options.
 - **App.tsx**: backend selector on the open-file screen. Queries backends at load, auto-falls-back if the saved backend isn't available, and filters the model list per backend (`large-v3-turbo` is MLX-only; `distil-large-v3` is WhisperX-only).
+- **Common install pitfall**: `package.json → dev:backend` hardcodes the venv Python (`/Users/kat/.cutscript-venv/bin/python`). Running plain `pip install mlx-whisper` installs into whatever `pip` is on PATH (often pyenv or system Python), not the venv — so `is_available()` returns `False` even after install. Must use `/Users/kat/.cutscript-venv/bin/pip install mlx-whisper`.
+- **MLX segment-end padding (word clipping fix)**: MLX (like Whisper) emits segment-end timestamps quantized to 20ms tokens that land at the last decoded phoneme position — **not** at the end of the word's acoustic decay (fricative tails, stop releases, nasal murmurs). `whisperx.align()` then clamps every segment's last word boundary to that too-early segment end, clipping the final word of *every segment* and the final word of the video. Fixed in `_transcribe_mlx_with_align` (`transcription.py`): after decode + dedup, every segment's `end` is padded forward by up to 400ms (capped at the next segment's reported start so alignment never crosses into the next segment's first onset), and the last segment's `end` is pushed to the full preprocessed audio duration. An earlier fix only padded the *last* segment and so only helped end-of-video clipping; this version fixes both the video end and the word tails at every inter-segment boundary. Note: existing AcousticMap caches built before this fix will contain stale `we`/`ae` values — clear the spectral cache from Settings after updating to get fresh, correctly-extended word tails.
 
 ---
 

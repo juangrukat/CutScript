@@ -41,7 +41,14 @@ from utils.cache import get_file_hash
 logger = logging.getLogger(__name__)
 
 SPECTRAL_CACHE_DIR = Path.home() / ".cutscript_spectral_cache"
-_MAP_VERSION = 1
+# v3: Additional EOF fix — when Whisper's `we` for the last word lands within
+# ~20ms of audio EOF, the tail window is too short (≤3 frames at hop=256,
+# sr=48000) to run the decay analysis, so the `if len(la_idx) > 3` guard
+# short-circuits and `ae` stays at its initial value. v3 initializes the
+# last word's `ae` to `lookahead_end` (the EOF cap) instead of `we`, so short
+# tail windows still extend to EOF. Without this, v2 caches show `ae == we`
+# for words like "freedom." and the final 20ms of nasal tail gets clipped.
+_MAP_VERSION = 3
 
 # Short-horizon window for all detection work. Matches _find_word_end's old cap,
 # but extended to 500ms for coda search because a /ʃ/ fricative can trail ~300ms
@@ -243,6 +250,7 @@ def _analyze_word(
     speech_threshold: float, fric_threshold_floor: float,
     rms_full, rms_full_t, band_rms, band_rms_t,
     hop_length: int,
+    is_last: bool = False,
 ) -> WordFingerprint:
     """Build a fingerprint for a single word by probing the audio around its WhisperX span."""
     import numpy as np
@@ -290,13 +298,31 @@ def _analyze_word(
     #   - nasal coda: broadband decay, but allow more time (nasals have slow tails).
     #   - stop coda: broadband decay; stops have sharp offsets, so default window.
     #   - vowel / approximant: broadband decay at -25dB below peak_rms.
-    lookahead_end = min(
-        len(y) / sr,
-        we + _CODA_SEARCH_MS / 1000.0,
-        next_ws - 0.005,  # never overrun the next word's WhisperX start
-    )
+    # For a mid-stream word the coda search cap is the next word's start minus
+    # a 5ms guard so `ae` never crosses into the next word's onset. For the
+    # LAST word of the audio there is no next word — the 5ms guard would just
+    # leave a hardcoded hole at the end of the video, so we let the cap run
+    # all the way to the audio end (EOF is its own natural boundary).
+    if is_last:
+        lookahead_end = min(
+            len(y) / sr,
+            we + _CODA_SEARCH_MS / 1000.0,
+        )
+    else:
+        lookahead_end = min(
+            len(y) / sr,
+            we + _CODA_SEARCH_MS / 1000.0,
+            next_ws - 0.005,
+        )
 
-    ae = we
+    # For the last word, initialize ae at the EOF cap rather than `we`. If the
+    # tail window [we, lookahead_end] is too short for decay analysis (fewer
+    # than ~4 frames — happens when Whisper's `we` lands within ~20ms of audio
+    # EOF, as with "freedom." at the end of the video), the decay branch below
+    # is skipped entirely, so this initial value is what ends up in the cache.
+    # Without this, the final word's `ae` collapses to `we` and the export
+    # refiner truncates any remaining nasal/coda tail audio.
+    ae = lookahead_end if is_last else we
     la_idx = _slice_at(rms_full_t, we, lookahead_end)
     la_band_idx = _slice_at(band_rms_t, we, lookahead_end)
 
@@ -337,8 +363,15 @@ def _analyze_word(
                     break
             if found is not None:
                 ae = float(rms_full_t[la_idx[found]])
-            # If never drops, coda extends beyond: this likely means another word
-            # starts immediately. Keep ae = we (caller will fall back or cap).
+            elif is_last:
+                # Last word + no decay found within the search window: the tail
+                # is running into EOF (e.g. the speaker's last syllable fades
+                # into silence after the cap, or the file truly ends mid-word).
+                # Extend to the cap so the final frames of the audio are kept —
+                # leaving ae=we here is what made end-of-video cuts fall short.
+                ae = float(lookahead_end)
+            # Mid-stream: if the decay never drops, another word likely starts
+            # immediately. Keep ae = we so we don't swallow the next word's onset.
 
     # Clamp: ae must be ≥ we (don't shrink the word), and ≤ lookahead_end.
     ae = max(we, min(ae, lookahead_end))
@@ -452,6 +485,7 @@ def analyze_file(
             rms_full=rms_full, rms_full_t=rms_full_t,
             band_rms=band_rms, band_rms_t=band_rms_t,
             hop_length=hop_length,
+            is_last=(i == N - 1),
         )
         fingerprints.append(fp)
         if N > 0 and i % max(1, N // 10) == 0:

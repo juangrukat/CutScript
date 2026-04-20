@@ -45,14 +45,24 @@ npm install
 # Frontend dependencies (React, Tailwind, Zustand)
 cd frontend && npm install && cd ..
 
-# Backend dependencies (run from repo root)
-pip install -r requirements.txt
+# Backend dependencies — install into the same Python the backend runs with.
+# Check package.json → dev:backend to see which Python binary is used,
+# then use the matching pip. Example for a project venv at ~/.cutscript-venv:
+/Users/kat/.cutscript-venv/bin/pip install -r requirements.txt
 
 # Optional: MLX Whisper backend (Apple Silicon only)
-pip install mlx-whisper
+# IMPORTANT: must use the same pip as above — plain `pip install mlx-whisper`
+# will often install into a different Python and the backend won't see it.
+/Users/kat/.cutscript-venv/bin/pip install mlx-whisper
 ```
 
 The MLX backend is auto-detected at startup: if `mlx-whisper` is importable on an arm64 Mac, the "Backend" dropdown on the open-file screen lights up a second option. Timestamps still route through WhisperX alignment, so there is no change to the seamless-cut pipeline.
+
+> **Troubleshooting — MLX option stays greyed out after `pip install mlx-whisper`:**
+> The backend runs under the specific Python listed in `package.json → dev:backend` (e.g. `/Users/kat/.cutscript-venv/bin/python`). Running plain `pip install` targets whatever Python `pip` resolves to in your shell, which is often a *different* interpreter (pyenv, system, etc.). Install with the venv's own pip as shown above, then restart the app.
+
+> **Troubleshooting — MLX transcripts clip word tails or the end of the video:**
+> Two independent clips existed and are both fixed. (1) MLX emits segment-end timestamps quantized to 20ms Whisper tokens that tend to land at the last phoneme, not at the end of the word's acoustic decay; the transcription layer now pads each MLX segment end forward (capped at the next segment's start, and the last segment to the full audio duration) so WhisperX's forced alignment can place word boundaries on the true decay point. (2) The AcousticMap's coda-search cap used a 5ms guard to avoid crossing the next word's start — but the final word has no next word, so the guard carved a hole at EOF and, when the decay threshold was never met inside the search window, the last word's `ae` collapsed back to its phoneme peak. The last word now extends through the search cap to the audio end. If you transcribed or analyzed a file **before** these fixes landed, clear the spectral cache (Settings → Clear spectral cache) and re-transcribe — otherwise the cached AcousticMap still reflects the old clipped boundaries.
 
 ### Run (Development)
 
