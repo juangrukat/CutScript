@@ -1,7 +1,13 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { Download, Loader2, Zap, Cog, Info } from 'lucide-react';
 import type { ExportOptions } from '../types/project';
+
+const IS_ELECTRON = !!window.electronAPI;
+
+function defaultOutputPath(videoPath: string) {
+  return videoPath.replace(/\.[^.]+$/, '_edited.mp4');
+}
 
 export default function ExportDialog() {
   const { videoPath, words, deletedRanges, isExporting, exportProgress, backendUrl, setExporting, getKeepSegments } =
@@ -16,20 +22,31 @@ export default function ExportDialog() {
     enhanceAudio: false,
     captions: 'none',
   });
+  const [browserOutputPath, setBrowserOutputPath] = useState('');
+  const [exportMessage, setExportMessage] = useState('');
+
+  useEffect(() => {
+    if (!IS_ELECTRON && videoPath) {
+      setBrowserOutputPath(defaultOutputPath(videoPath));
+    }
+  }, [videoPath]);
 
   const handleExport = useCallback(async () => {
     if (!videoPath) return;
 
-    const outputPath = await window.electronAPI?.saveFile({
-      defaultPath: videoPath.replace(/\.[^.]+$/, '_edited.mp4'),
-      filters: [
-        { name: 'MP4', extensions: ['mp4'] },
-        { name: 'MOV', extensions: ['mov'] },
-        { name: 'WebM', extensions: ['webm'] },
-      ],
-    });
+    const outputPath = IS_ELECTRON
+      ? await window.electronAPI?.saveFile({
+          defaultPath: defaultOutputPath(videoPath),
+          filters: [
+            { name: 'MP4', extensions: ['mp4'] },
+            { name: 'MOV', extensions: ['mov'] },
+            { name: 'WebM', extensions: ['webm'] },
+          ],
+        })
+      : browserOutputPath.trim();
     if (!outputPath) return;
 
+    setExportMessage('');
     setExporting(true, 0);
     try {
       const keepSegments = getKeepSegments();
@@ -50,21 +67,39 @@ export default function ExportDialog() {
           // AcousticMap on demand if the spectral cache was cleared since
           // transcription. Captions still gate inclusion of deleted_indices.
           words,
+          force_refine: hasCuts,
           deleted_indices: options.captions !== 'none' ? [...deletedSet] : undefined,
           ...options,
         }),
       });
       if (!res.ok) throw new Error(`Export failed: ${res.statusText}`);
+      setExportMessage(`Exported to ${outputPath}`);
       setExporting(false, 100);
     } catch (err) {
       console.error('Export error:', err);
+      setExportMessage(`Export failed: ${err}`);
       setExporting(false);
     }
-  }, [videoPath, options, backendUrl, setExporting, getKeepSegments]);
+  }, [videoPath, browserOutputPath, words, deletedRanges, hasCuts, options, backendUrl, setExporting, getKeepSegments]);
 
   return (
     <div className="p-4 space-y-5">
       <h3 className="text-sm font-semibold">Export Video</h3>
+
+      {!IS_ELECTRON && (
+        <div className="space-y-1">
+          <label className="text-xs text-editor-text-muted font-medium">Output path</label>
+          <input
+            type="text"
+            value={browserOutputPath}
+            onChange={(e) => setBrowserOutputPath(e.target.value)}
+            className="w-full px-3 py-2 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
+          />
+          <p className="text-[10px] text-editor-text-muted">
+            Browser dev mode cannot open the native save dialog. Paste a full writable path.
+          </p>
+        </div>
+      )}
 
       {/* Mode */}
       <fieldset className="space-y-2">
@@ -123,6 +158,15 @@ export default function ExportDialog() {
         />
         <span className="text-xs">Enhance audio (Studio Sound)</span>
       </label>
+      {options.enhanceAudio && (
+        <div className="flex items-start gap-1.5 p-2 bg-editor-warning/10 rounded text-[10px] text-editor-warning">
+          <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+          <span>
+            Studio Sound changes the audio. It denoises, converts to mono 48 kHz,
+            re-levels loudness, and limits peaks before muxing.
+          </span>
+        </div>
+      )}
 
       {/* Captions */}
       <SelectField
@@ -139,7 +183,7 @@ export default function ExportDialog() {
       {/* Export button */}
       <button
         onClick={handleExport}
-        disabled={isExporting || !videoPath}
+        disabled={isExporting || !videoPath || (!IS_ELECTRON && !browserOutputPath.trim())}
         className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-editor-accent hover:bg-editor-accent-hover disabled:opacity-50 rounded-lg text-sm font-semibold transition-colors"
       >
         {isExporting ? (
@@ -154,6 +198,12 @@ export default function ExportDialog() {
           </>
         )}
       </button>
+
+      {exportMessage && (
+        <p className="text-[10px] text-editor-text-muted break-words">
+          {exportMessage}
+        </p>
+      )}
 
       {options.mode === 'fast' && !hasCuts && (
         <p className="text-[10px] text-editor-text-muted text-center">

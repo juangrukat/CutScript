@@ -341,6 +341,7 @@ export default function AIPanel() {
             keep_segments: keepSegments,
             mode: 'fast',
             format: 'mp4',
+            force_refine: true,
             words: wordsPayload.map(({ word, start, end }) => ({
               word,
               start: start ?? 0,

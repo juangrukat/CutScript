@@ -44,7 +44,8 @@
           "id": { "type": "string" },
           "start": { "type": "number" },
           "end": { "type": "number" },
-          "wordIndices": { "type": "array", "items": { "type": "integer" } }
+          "wordIndices": { "type": "array", "items": { "type": "integer" } },
+          "kind": { "type": "string", "enum": ["words", "silence"] }
         }
       }
     },

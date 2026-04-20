@@ -7,10 +7,202 @@ import logging
 import subprocess
 import tempfile
 import os
+from fractions import Fraction
 from pathlib import Path
 from typing import List
 
 logger = logging.getLogger(__name__)
+
+BOUNDARY_FADE_DUR = 0.012
+EOF_FADE_DUR = 0.012
+
+
+def _parse_fps(value: str) -> float:
+    """Parse ffprobe frame-rate strings like '24000/1001' safely."""
+    try:
+        if not value:
+            return 0.0
+        return float(Fraction(value))
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _source_timing(src: dict) -> tuple[float, float, float]:
+    """Return source video duration, audio duration, and frame duration."""
+    fmt_duration = float(src.get("duration") or 0.0)
+    video_duration = float(src.get("video_duration") or 0.0) or fmt_duration
+    audio_duration = float(src.get("audio_duration") or 0.0) or fmt_duration
+    fps = float(src.get("fps") or 0.0)
+    frame_duration = 1.0 / fps if fps > 0 else 0.0
+    return video_duration, audio_duration, frame_duration
+
+
+def _touches_source_eof(
+    end: float,
+    video_duration: float,
+    audio_duration: float,
+    frame_duration: float,
+) -> bool:
+    """
+    Treat EOF as an audio-first boundary.
+
+    Video lands on a frame grid, but speech tails live on the audio sample grid.
+    A segment ending within roughly one video frame of video EOF should preserve
+    audio to audio EOF when the source audio runs slightly longer than video.
+    """
+    eof_tolerance = max(0.100, frame_duration * 1.5)
+    return (
+        (audio_duration > 0 and end >= audio_duration - eof_tolerance)
+        or (video_duration > 0 and end >= video_duration - eof_tolerance)
+    )
+
+
+def _av_trim_ranges(
+    keep_segments: List[dict],
+    src_video_duration: float,
+    src_audio_duration: float,
+    frame_duration: float,
+) -> list[dict]:
+    """
+    Build separate video/audio trim ranges.
+
+    Internal cuts keep the same nominal timestamps for A/V sync. Final EOF cuts
+    clamp video to video EOF while allowing audio to reach audio EOF, preserving
+    low-energy speech codas that may extend beyond the last video frame.
+    """
+    ranges = []
+    for i, seg in enumerate(keep_segments):
+        start = max(0.0, float(seg["start"]))
+        end = max(start, float(seg["end"]))
+        is_last = i == len(keep_segments) - 1
+        touches_eof = is_last and _touches_source_eof(
+            end,
+            src_video_duration,
+            src_audio_duration,
+            frame_duration,
+        )
+
+        video_start = min(start, src_video_duration) if src_video_duration > 0 else start
+        audio_start = min(start, src_audio_duration) if src_audio_duration > 0 else start
+
+        if touches_eof:
+            video_end = src_video_duration if src_video_duration > 0 else end
+            audio_end = src_audio_duration if src_audio_duration > 0 else end
+        else:
+            video_end = min(end, src_video_duration) if src_video_duration > 0 else end
+            audio_end = min(end, src_audio_duration) if src_audio_duration > 0 else end
+
+        video_end = max(video_start, video_end)
+        audio_end = max(audio_start, audio_end)
+        video_pad = 0.0
+        if touches_eof:
+            video_pad = max(
+                0.0,
+                (audio_end - audio_start) - (video_end - video_start) + (2 * frame_duration),
+            )
+        ranges.append(
+            {
+                "video_start": video_start,
+                "video_end": video_end,
+                "audio_start": audio_start,
+                "audio_end": audio_end,
+                "video_pad": video_pad,
+                "touches_eof": touches_eof,
+            }
+        )
+
+    return ranges
+
+
+def _log_av_trim_ranges(ranges: list[dict], frame_duration: float) -> None:
+    """Log meaningful A/V trim-duration differences for export diagnostics."""
+    tolerance = max(frame_duration, 0.020)
+    for i, av in enumerate(ranges):
+        video_dur = av["video_end"] - av["video_start"]
+        audio_dur = av["audio_end"] - av["audio_start"]
+        delta = audio_dur - video_dur
+        if av["touches_eof"] or abs(delta) > tolerance:
+            logger.info(
+                "A/V trim segment %d: video %.6f-%.6f (%.3fs), "
+                "audio %.6f-%.6f (%.3fs), delta=%+.3fs%s",
+                i,
+                av["video_start"],
+                av["video_end"],
+                video_dur,
+                av["audio_start"],
+                av["audio_end"],
+                audio_dur,
+                delta,
+                (
+                    f" EOF video_pad={av['video_pad']:.3f}s"
+                    if av["touches_eof"] and av.get("video_pad", 0.0) > 0
+                    else " EOF"
+                    if av["touches_eof"]
+                    else ""
+                ),
+            )
+
+
+def _build_trim_concat_filters(
+    audio_input: str,
+    keep_segments: List[dict],
+    src_video_duration: float,
+    src_audio_duration: float,
+    frame_duration: float,
+) -> tuple[str, bool]:
+    """Build the shared A/V trim + concat filter graph."""
+    filter_parts = []
+    av_ranges = _av_trim_ranges(
+        keep_segments,
+        src_video_duration,
+        src_audio_duration,
+        frame_duration,
+    )
+    _log_av_trim_ranges(av_ranges, frame_duration)
+
+    n = len(av_ranges)
+    final_touches_source_eof = bool(av_ranges and av_ranges[-1]["touches_eof"])
+
+    for i, av in enumerate(av_ranges):
+        audio_dur = av["audio_end"] - av["audio_start"]
+        video_filter = (
+            f"[0:v]trim=start={av['video_start']:.6f}:end={av['video_end']:.6f},"
+            "setpts=PTS-STARTPTS"
+        )
+        if av.get("video_pad", 0.0) > 0:
+            video_filter += f",tpad=stop_mode=clone:stop_duration={av['video_pad']:.6f}"
+
+        audio_steps = []
+        if i > 0:
+            audio_steps.append(f"afade=t=in:d={BOUNDARY_FADE_DUR}:curve=esin")
+        if i < n - 1:
+            fade_start = max(0.0, audio_dur - BOUNDARY_FADE_DUR)
+            audio_steps.append(
+                f"afade=t=out:st={fade_start:.6f}:d={BOUNDARY_FADE_DUR}:curve=esin"
+            )
+        elif av["touches_eof"] and audio_dur > EOF_FADE_DUR:
+            fade_start = max(0.0, audio_dur - EOF_FADE_DUR)
+            audio_steps.append(
+                f"afade=t=out:st={fade_start:.6f}:d={EOF_FADE_DUR}:curve=esin"
+            )
+        audio_filter = ("," + ",".join(audio_steps)) if audio_steps else ""
+
+        filter_parts.append(
+            f"{video_filter}[v{i}];"
+            f"{audio_input}atrim=start={av['audio_start']:.6f}:end={av['audio_end']:.6f},"
+            f"asetpts=PTS-STARTPTS{audio_filter}[a{i}];"
+        )
+
+    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
+    filter_parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa_raw];")
+    if n == 1 or final_touches_source_eof:
+        filter_parts.append("[outa_raw]anull[outa]")
+    else:
+        # EBU R128 loudness normalization on the full concat — consistent output
+        # level without per-segment pumping artifacts.
+        filter_parts.append("[outa_raw]loudnorm=I=-16:TP=-1.5:LRA=11[outa]")
+
+    return "".join(filter_parts), final_touches_source_eof
 
 
 def _find_ffmpeg() -> str:
@@ -125,6 +317,7 @@ def export_reencode(
     # Probe source specs — only downscale if target is smaller, never upscale.
     src = get_video_info(input_path)
     src_height = src.get("height", 0)
+    src_video_duration, src_audio_duration, frame_duration = _source_timing(src)
     src_sample_rate = src.get("audio_sample_rate", 0) or 48000
     src_audio_bitrate = src.get("audio_bitrate", 0)
     # Use source audio bitrate clamped to a reasonable range; fall back to 192k.
@@ -140,37 +333,17 @@ def export_reencode(
     if audio_wav_path:
         ffmpeg_inputs += ["-i", str(Path(audio_wav_path).resolve())]
 
-    # Per-segment audio: 12 ms equal-power fade at every cut boundary eliminates
-    # click/pop from waveform discontinuities. afade does not alter segment duration
-    # so A/V sync is preserved. Loudness normalization (EBU R128) is applied once
-    # after concat — doing it per-segment with speechnorm caused audible pumping
-    # artifacts due to the aggressive expansion coefficient.
-    FADE_DUR = 0.012
-
-    filter_parts = []
-    n = len(keep_segments)
-    for i, seg in enumerate(keep_segments):
-        seg_dur = seg["end"] - seg["start"]
-        audio_steps = []
-        if i > 0:
-            audio_steps.append(f"afade=t=in:d={FADE_DUR}:curve=esin")
-        if i < n - 1:
-            fade_start = max(0.0, seg_dur - FADE_DUR)
-            audio_steps.append(f"afade=t=out:st={fade_start:.6f}:d={FADE_DUR}:curve=esin")
-        audio_filter = ("," + ",".join(audio_steps)) if audio_steps else ""
-
-        filter_parts.append(
-            f"[0:v]trim=start={seg['start']}:end={seg['end']},setpts=PTS-STARTPTS[v{i}];"
-            f"{audio_input}atrim=start={seg['start']}:end={seg['end']},asetpts=PTS-STARTPTS{audio_filter}[a{i}];"
-        )
-
-    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
-    filter_parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa_raw];")
-    # EBU R128 loudness normalization on the full concat — consistent output level
-    # without per-segment pumping artifacts.
-    filter_parts.append("[outa_raw]loudnorm=I=-16:TP=-1.5:LRA=11[outa]")
-
-    filter_complex = "".join(filter_parts)
+    # Per-segment audio fades eliminate click/pop at edit boundaries. EOF
+    # handling is audio-first: preserve the source audio tail, hold the final
+    # video frame long enough to carry it, then apply only a tiny terminal fade
+    # into encoder padding.
+    filter_complex, _ = _build_trim_concat_filters(
+        audio_input,
+        keep_segments,
+        src_video_duration,
+        src_audio_duration,
+        frame_duration,
+    )
 
     if scale:
         filter_complex += f";[outv]{scale}[outv_scaled]"
@@ -195,7 +368,10 @@ def export_reencode(
         output_path,
     ]
 
-    logger.info(f"Re-encoding {n} segments -> {output_path} (src {src_height}p, out {scale or 'native'})")
+    logger.info(
+        f"Re-encoding {len(keep_segments)} segments -> {output_path} "
+        f"(src {src_height}p, out {scale or 'native'})"
+    )
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg re-encode failed: {result.stderr[-500:]}")
@@ -229,6 +405,7 @@ def export_reencode_with_subs(
 
     src = get_video_info(input_path)
     src_height = src.get("height", 0)
+    src_video_duration, src_audio_duration, frame_duration = _source_timing(src)
     src_sample_rate = src.get("audio_sample_rate", 0) or 48000
     src_audio_bitrate = src.get("audio_bitrate", 0)
     audio_br = f"{min(max(src_audio_bitrate // 1000, 64), 320)}k" if src_audio_bitrate > 0 else "192k"
@@ -242,30 +419,13 @@ def export_reencode_with_subs(
     if audio_wav_path:
         ffmpeg_inputs += ["-i", str(Path(audio_wav_path).resolve())]
 
-    FADE_DUR = 0.012  # 12 ms equal-power boundary fade — eliminates click artifacts
-
-    filter_parts = []
-    n = len(keep_segments)
-    for i, seg in enumerate(keep_segments):
-        seg_dur = seg["end"] - seg["start"]
-        audio_steps = []
-        if i > 0:
-            audio_steps.append(f"afade=t=in:d={FADE_DUR}:curve=esin")
-        if i < n - 1:
-            fade_start = max(0.0, seg_dur - FADE_DUR)
-            audio_steps.append(f"afade=t=out:st={fade_start:.6f}:d={FADE_DUR}:curve=esin")
-        audio_filter = ("," + ",".join(audio_steps)) if audio_steps else ""
-
-        filter_parts.append(
-            f"[0:v]trim=start={seg['start']}:end={seg['end']},setpts=PTS-STARTPTS[v{i}];"
-            f"{audio_input}atrim=start={seg['start']}:end={seg['end']},asetpts=PTS-STARTPTS{audio_filter}[a{i}];"
-        )
-
-    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(n))
-    filter_parts.append(f"{concat_inputs}concat=n={n}:v=1:a=1[outv][outa_raw]")
-    filter_parts.append("[outa_raw]loudnorm=I=-16:TP=-1.5:LRA=11[outa]")
-
-    filter_complex = "".join(filter_parts)
+    filter_complex, _ = _build_trim_concat_filters(
+        audio_input,
+        keep_segments,
+        src_video_duration,
+        src_audio_duration,
+        frame_duration,
+    )
 
     # Escape path for FFmpeg subtitle filter (Windows backslashes need escaping)
     escaped_sub = subtitle_path.replace("\\", "/").replace(":", "\\:")
@@ -293,7 +453,10 @@ def export_reencode_with_subs(
         output_path,
     ]
 
-    logger.info(f"Re-encoding {n} segments with subtitles -> {output_path} (src {src_height}p, out {scale or 'native'})")
+    logger.info(
+        f"Re-encoding {len(keep_segments)} segments with subtitles -> {output_path} "
+        f"(src {src_height}p, out {scale or 'native'})"
+    )
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"FFmpeg re-encode with subs failed: {result.stderr[-500:]}")
@@ -325,11 +488,13 @@ def get_video_info(input_path: str) -> dict:
             "duration": float(fmt.get("duration", 0)),
             "size": int(fmt.get("size", 0)),
             "format": fmt.get("format_name", ""),
+            "video_duration": float(video_stream.get("duration", 0) or 0),
             "width": int(video_stream.get("width", 0)),
             "height": int(video_stream.get("height", 0)),
             "codec": video_stream.get("codec_name", ""),
-            "fps": eval(video_stream.get("r_frame_rate", "0/1")) if "/" in video_stream.get("r_frame_rate", "") else 0,
+            "fps": _parse_fps(video_stream.get("avg_frame_rate", "") or video_stream.get("r_frame_rate", "")),
             "audio_codec": audio_stream.get("codec_name", ""),
+            "audio_duration": float(audio_stream.get("duration", 0) or 0),
             "audio_sample_rate": int(audio_stream.get("sample_rate", 0) or 0),
             "audio_channels": int(audio_stream.get("channels", 2) or 2),
             "audio_bitrate": int(audio_stream.get("bit_rate", 0) or 0),

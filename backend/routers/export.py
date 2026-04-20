@@ -13,6 +13,7 @@ from services.video_editor import (
     export_stream_copy,
     export_reencode,
     export_reencode_with_subs,
+    get_video_info,
 )
 from services.audio_cleaner import clean_audio
 from services.caption_generator import generate_srt, generate_ass, save_captions
@@ -47,6 +48,24 @@ class ExportRequest(BaseModel):
     captions: str = "none"
     words: Optional[List[ExportWordModel]] = None
     deleted_indices: Optional[List[int]] = None
+    force_refine: bool = False
+
+
+def _segment_covers_source(
+    segment: dict, input_path: str, tolerance: float = 0.050
+) -> bool:
+    """
+    Return True when a single keep segment effectively covers the whole source.
+
+    Fast export can safely stream-copy that case.  A single non-full segment,
+    however, is still a cut: if it came from word timestamps, bypassing
+    AcousticMap refinement can trim the coda of the final kept word.
+    """
+    info = get_video_info(input_path)
+    duration = float(info.get("duration") or 0.0)
+    if duration <= 0:
+        return False
+    return segment["start"] <= tolerance and segment["end"] >= duration - tolerance
 
 
 def _gap_has_speech(y, sr: float, t0: float, t1: float, threshold: float) -> bool:
@@ -612,15 +631,29 @@ async def export_video(req: ExportRequest):
         if not segments:
             raise HTTPException(status_code=400, detail="No segments to export")
 
-        use_stream_copy = req.mode == "fast" and len(segments) == 1
-        needs_reencode_for_subs = req.captions == "burn-in"
-
-        # Burn-in captions require re-encode
-        if needs_reencode_for_subs:
-            use_stream_copy = False
-
         words_dicts = [w.model_dump() for w in req.words] if req.words else []
         deleted_set = set(req.deleted_indices or [])
+
+        needs_reencode_for_subs = req.captions == "burn-in"
+        single_segment_full_span = (
+            len(segments) == 1 and _segment_covers_source(segments[0], req.input_path)
+        )
+        needs_boundary_refinement = bool(
+            req.force_refine or (words_dicts and not single_segment_full_span)
+        )
+
+        use_stream_copy = (
+            req.mode == "fast"
+            and len(segments) == 1
+            and not needs_reencode_for_subs
+            and not needs_boundary_refinement
+        )
+
+        if req.mode == "fast" and len(segments) == 1 and needs_boundary_refinement:
+            logger.info(
+                "Fast single-segment export is using refined re-encode "
+                "because the segment is word-aligned and does not cover the full source"
+            )
 
         # Generate ASS file for burn-in
         ass_path = None

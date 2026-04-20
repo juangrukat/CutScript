@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { temporal } from 'zundo';
 import type { Word, Segment, DeletedRange, TranscriptionResult } from '../types/project';
+import { getSilenceRanges, SILENCE_GAP_THRESHOLD_S } from '../utils/silence';
 
 interface EditorState {
   videoPath: string | null;
@@ -36,6 +37,8 @@ interface EditorActions {
   setHoveredWordIndex: (index: number | null) => void;
   deleteSelectedWords: () => void;
   deleteWordRange: (startIndex: number, endIndex: number) => void;
+  deleteSilenceRange: (start: number, end: number) => void;
+  deleteAllSilences: (threshold?: number) => void;
   restoreRange: (rangeId: string) => void;
   clearAllDeletions: () => void;
   setTranscribing: (active: boolean, progress?: number) => void;
@@ -120,6 +123,7 @@ export const useEditorStore = create<EditorState & EditorActions>()(
           start: startWord.start,
           end: endWord.end,
           wordIndices: sorted,
+          kind: 'words',
         };
 
         set({
@@ -138,9 +142,66 @@ export const useEditorStore = create<EditorState & EditorActions>()(
           start: words[startIndex].start,
           end: words[endIndex].end,
           wordIndices: indices,
+          kind: 'words',
         };
 
         set({ deletedRanges: [...deletedRanges, newRange] });
+      },
+
+      deleteSilenceRange: (start, end) => {
+        const { deletedRanges } = get();
+        const safeStart = Math.max(0, Math.min(start, end));
+        const safeEnd = Math.max(safeStart, Math.max(start, end));
+        if (safeEnd - safeStart < 0.050) return;
+
+        const alreadyDeleted = deletedRanges.some((range) => {
+          const isSilence = range.kind === 'silence' || range.wordIndices.length === 0;
+          return (
+            isSilence
+            && Math.abs(range.start - safeStart) < 0.010
+            && Math.abs(range.end - safeEnd) < 0.010
+          );
+        });
+        if (alreadyDeleted) return;
+
+        const newRange: DeletedRange = {
+          id: `dr_${nextRangeId++}`,
+          start: safeStart,
+          end: safeEnd,
+          wordIndices: [],
+          kind: 'silence',
+        };
+
+        set({ deletedRanges: [...deletedRanges, newRange] });
+      },
+
+      deleteAllSilences: (threshold = SILENCE_GAP_THRESHOLD_S) => {
+        const { words, duration, deletedRanges } = get();
+        const silenceRanges = getSilenceRanges(words, duration, threshold);
+        const additions: DeletedRange[] = [];
+
+        for (const silence of silenceRanges) {
+          const alreadyDeleted = deletedRanges.some((range) => {
+            const isSilence = range.kind === 'silence' || range.wordIndices.length === 0;
+            return (
+              isSilence
+              && Math.abs(range.start - silence.start) < 0.010
+              && Math.abs(range.end - silence.end) < 0.010
+            );
+          });
+          if (alreadyDeleted) continue;
+          additions.push({
+            id: `dr_${nextRangeId++}`,
+            start: silence.start,
+            end: silence.end,
+            wordIndices: [],
+            kind: 'silence',
+          });
+        }
+
+        if (additions.length > 0) {
+          set({ deletedRanges: [...deletedRanges, ...additions] });
+        }
       },
 
       restoreRange: (rangeId) => {
@@ -209,7 +270,31 @@ export const useEditorStore = create<EditorState & EditorActions>()(
           lastSeg.end = Math.min(nextDeletedStart, durationCap, lastSeg.end + 1.5);
         }
 
-        return segments;
+        const silenceCuts = deletedRanges
+          .filter((range) => range.kind === 'silence' || range.wordIndices.length === 0)
+          .sort((a, b) => a.start - b.start);
+
+        const subtractTimeRange = (
+          sourceSegments: Array<{ start: number; end: number }>,
+          cut: { start: number; end: number },
+        ) => {
+          const next: Array<{ start: number; end: number }> = [];
+          for (const segment of sourceSegments) {
+            if (cut.end <= segment.start || cut.start >= segment.end) {
+              next.push(segment);
+              continue;
+            }
+            if (cut.start > segment.start) {
+              next.push({ start: segment.start, end: Math.min(cut.start, segment.end) });
+            }
+            if (cut.end < segment.end) {
+              next.push({ start: Math.max(cut.end, segment.start), end: segment.end });
+            }
+          }
+          return next.filter((segment) => segment.end - segment.start > 0.010);
+        };
+
+        return silenceCuts.reduce(subtractTimeRange, segments);
       },
 
       getWordAtTime: (time) => {

@@ -24,6 +24,7 @@ export interface TimeRange {
 export interface DeletedRange extends TimeRange {
   id: string;
   wordIndices: number[];
+  kind?: 'words' | 'silence';
 }
 
 export interface ProjectFile {

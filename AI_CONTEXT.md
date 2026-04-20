@@ -1,226 +1,136 @@
-# CutScript — AI Session Context
+# CutScript Current Handoff
 
-Onboarding notes for a new AI session. Describes the architecture, the edit pipeline, and the latest AI-layer rework.
+This file intentionally replaces the older broad architecture notes. The active work is about silence removal, smoother joins, EOF-safe export, and Studio Sound.
 
----
+## Current Product Direction
 
-## What CutScript Is
+CutScript is moving from word-only transcript cutting toward two kinds of editable removals:
 
-A local-first, Descript-style text-based video editor. The user transcribes a video with WhisperX (word-level timestamps), edits the transcript (delete, filler removal, focus modes, clip extraction), and exports a seamless cut video. Stack: Electron + React frontend, FastAPI Python backend, WhisperX + librosa + FFmpeg. LLM features via Ollama / OpenAI / Anthropic. Optional MLX Whisper decode backend on Apple Silicon (still word-aligned by WhisperX).
+- word cuts: transcript word-index ranges
+- silence cuts: timestamp-only gaps derived from word timing
 
----
+The goal is not just to remove material, but to make joins sound natural after speech or silence is removed.
 
-## The One Truth: Word-Index Ranges
+## Silence Markers And Silence Cuts
 
-Every edit — manual selection, filler removal, focus plan, clip extraction — converges on **word-index ranges in the transcript**. These become `DeletedRange` objects in the editor store. `getKeepSegments()` turns them into time ranges, `/export` feeds them to `_refine_from_map` (AcousticMap-guided), ffmpeg concat+loudnorm produces the final cut.
+The transcript still stores real words only. Silence is derived from gaps between adjacent word timestamps.
 
-This is why everything sounds equally seamless — clips, focus cuts, fillers, manual edits all traverse the same refinement pipeline.
+Implemented frontend behavior:
 
----
+- `frontend/src/utils/silence.ts` derives silence ranges from `words`, `duration`, and a `0.5s` threshold.
+- `TranscriptEditor` renders each pause inline as a marker like `... 0.7s`.
+- Clicking an uncut pause marker cuts that silence.
+- Clicking a cut pause marker restores it.
+- The transcript header has `Cut N pauses` to remove all detected pauses.
+- `DeletedRange.kind` can now be `words` or `silence`.
+- Silence cuts use `wordIndices: []`.
+- `shared/project-schema.json` accepts optional `kind`.
 
-## Transcription Backends
+Export behavior:
 
-Two decoder paths converge on the same aligner:
+- `editorStore.getKeepSegments()` still builds speech ranges from word deletions first.
+- It then subtracts silence time ranges.
+- The backend receives ordinary keep segments, so the existing export/refinement path remains in use.
 
-- **WhisperX** (default) — faster-whisper decode + WhisperX wav2vec2 alignment.
-- **MLX Whisper** (optional, Apple Silicon) — `mlx-whisper` decode + WhisperX wav2vec2 alignment. Repos come from `mlx-community/whisper-*` (see `transcription_mlx.MLX_REPOS`).
+Important next product decision:
 
-`backend/services/transcription.py` dispatches on `backend` (`"whisperx" | "mlx"`). Both paths funnel into the shared `_align_and_pack()` helper that runs `whisperx.align()` and produces the final `{words, segments, language}`. **Word-timestamp precision is identical across backends** — only the Whisper decode itself differs.
+- Full pause removal can sound rushed.
+- Add a "shorten pauses" mode next: reduce pauses over a threshold to a target remainder such as `80-150ms`.
+- This should become the default for natural speech pacing; full removal can remain an aggressive option.
 
-`backend/services/transcription_mlx.py` is lazily imported: `is_available()` returns `(False, "...")` when MLX isn't runnable (non-arm64 mac or `mlx-whisper` missing). The frontend calls `GET /transcribe/backends` at app load and disables the MLX option accordingly; if the user's saved backend isn't available, it falls back to WhisperX.
+## Join Quality And Adaptive Splice Direction
 
-The cache key (`_make_cache_op`) includes `backend` so MLX and WhisperX transcripts never collide in `~/.obs_transcriber_cache/`. `distil-large-v3` exists only under WhisperX; `large-v3-turbo` exists only under MLX. The router enforces this per-backend via `ensure_model_matches_backend()`.
+Current renderer behavior:
 
----
+- Re-encode exports use PCM WAV extraction for sample-accurate audio trimming.
+- Internal joins get short `12ms` audio fade-out/fade-in ramps.
+- EOF exports are audio-first and skip `loudnorm` when the final range touches source EOF.
 
-## The Cut Pipeline at a Glance
+Reasoning:
 
-```
-open video → WhisperX or MLX transcribe → /analyze builds AcousticMap (cached)
-                                       │
-                                       ▼
-edit in UI (manual / filler / focus / clip) → getKeepSegments()  →  /export
-                                       │
-                                       ▼
-  extract PCM WAV → _refine_from_map (AcousticMap-guided)  → ffmpeg trim+concat+loudnorm
-                   (or _refine_segments fallback if map missing)
-```
+- For word cuts, a true crossfade can smear deleted speech back into the output.
+- For silence cuts, there is usually safe room tone on both sides, so an adaptive crossfade is more feasible.
+- Adaptive splice mode should be conservative:
+  - keep `12ms` micro-fades as baseline
+  - allow `20-40ms` equal-power crossfades only when the deleted gap is silence or room tone
+  - avoid internal video padding because it creates visible micro-freezes
+  - do not use spectral/EQ matching as a default product behavior
 
-Two disk caches, both cleanable from the Settings panel:
+Future adaptive splice inputs:
 
-- `~/.obs_transcriber_cache/<hash>_<model>_transcribe_wx_*.json` — WhisperX results
-- `~/.cutscript_spectral_cache/<hash>.json` — AcousticMap fingerprints
+- derived silence ranges from the frontend
+- gap energy from backend audio analysis
+- local RMS/log-mel discontinuity around the join
+- click risk at the exact boundary
 
-File hash = md5(path + size + mtime).
+## EOF Export And Verification
 
----
+The important EOF fix is already in production export code:
 
-## AcousticMap (refinement primary)
+- final segment that touches source EOF preserves audio to source audio EOF
+- video clamps to source video EOF
+- final video frame is padded only at EOF so audio can finish cleanly
+- EOF exports skip `loudnorm`
+- EOF gets only a tiny terminal fade
 
-Built at ingest time by `POST /analyze` and consumed at export time by `_refine_from_map`. Lives in `backend/services/audio_analyzer.py`.
+The standalone verifier remains experimental under `tests/waveform_analysis/export_verifier/`.
 
-**Per-word `WordFingerprint`:** WhisperX start/end (`ws`/`we`), **acoustic** start/end (`as_`/`ae` — these are the refined boundaries), onset/coda phoneme classes (fricative/stop/nasal/vowel/approximant), `peak_rms`, `peak_fric` (2-8 kHz), intraword `dips`.
+Verifier direction:
 
-**Coda-specific decay policies** in `_refine_from_map` control how far `ae` extends past `we`: fricative tails get band+broadband both-below; nasals/stops/vowels use tiered dB thresholds (-18/-20/-25). Clamps to audio duration; drops any segment <10 ms.
+- compare source audio to rendered output, not Whisper re-transcription
+- use aligned RMS envelope and log-mel similarity
+- add small-lag alignment before scoring
+- add EOF boundary checks over final `150-300ms`
+- keep it report-only until validated on more fixtures
 
-**Last-word special case (end-of-video fix).** The coda search cap is normally `next_ws - 5ms` — a guard that stops `ae` crossing into the next word's onset and, historically, prevented zero/negative-duration segments downstream. For the *final* word of the audio there is no next word, so the 5ms guard only carves out a hardcoded hole at EOF. `_analyze_word` now takes an `is_last` flag: when true, `lookahead_end` drops the `next_ws - 0.005` term and, for non-fricative codas where the decay threshold is never met inside the search window, `ae` is set to the cap instead of staying at `we`. Together these changes let the final word's tail run all the way to the audio end instead of getting trimmed by (up to) the coda search window. Mid-stream words keep the guard.
+## Studio Sound / Enhance Audio
 
-Legacy `_refine_segments` kept only as a fallback (same safety clamps).
+`requirements.txt` includes `deepfilternet>=0.5.0`, so DeepFilterNet is intended to be a standard dependency.
 
----
+Bug found:
 
-## AI Layer — current architecture
+- DeepFilterNet was selected when installed, but its loader could not read MP4/AAC directly.
+- Export caught the failure as non-fatal, so enhanced exports could be identical to non-enhanced exports.
+- `tests/video/t1_edited.mp4` and `tests/video/t1A_edited.mp4` were byte-for-byte identical before the fix.
 
-Three features, one pipeline:
+Fix implemented:
 
-| Feature | Endpoint | Output |
-|---|---|---|
-| Filler detection (multilingual) | `POST /ai/filler-removal` | `FillerReport` |
-| Clip candidates (multi-duration) | `POST /ai/create-clip` | `ClipPlan` |
-| Focus modes (redundancy/tighten/key_points/qa_extract/topic) | `POST /ai/focus` | `FocusPlan` |
+- `backend/services/audio_cleaner.py` now decodes any media input to a temporary mono WAV before DeepFilterNet.
+- DeepFilterNet output is post-processed with:
+  - `highpass=f=70`
+  - `loudnorm=I=-16:TP=-1.5:LRA=11`
+  - output sample rate constrained to `48000`
+- FFmpeg fallback also uses denoise plus the same highpass/loudness/peak-control finish.
 
-### Structured output
+Measured on `t1_edited.mp4`:
 
-Every call uses **native constrained decoding**:
+- before enhancement: quiet-frame floor around `-26.9 dBFS`, SNR proxy around `9 dB`
+- raw DeepFilter: quiet-frame floor around `-50.9 dBFS`, SNR proxy around `31 dB`, but too quiet and peak-unsafe
+- finished Studio Sound chain: quiet-frame floor around `-47.6 dBFS`, SNR proxy around `30 dB`, integrated loudness around `-15.7 LUFS`, true peak `-1.5 dBTP`
 
-- **OpenAI**: `response_format={"type": "json_schema", "json_schema": {..., "strict": True}}`. The helper `_strictify_schema` in `ai_provider.py` transforms Pydantic schemas by adding `additionalProperties: false`, marking every field required, stripping `default` and `title`.
-- **Anthropic**: forced tool-use. A virtual tool is invented with `input_schema = <Pydantic schema>`, `tool_choice` forces the tool, we read `tool_use.input`.
-- **Ollama**: `format: <schema>` (Ollama 0.5+). Falls back to brace-extract if validation fails.
+Frontend warning:
 
-Every response goes through `response_model.model_validate(raw)` (Pydantic). The old "find the first `{`" parser is only used as a last resort if JSON decoding fails outright.
+- Export dialog now warns that Studio Sound changes audio.
+- It denoises, converts to mono 48 kHz, re-levels loudness, and limits peaks.
 
-### The shared validator
+Open caution:
 
-`backend/services/ai_validator.py` owns all the Pydantic models and per-feature validators:
+- Studio Sound improves noise floor but can make joins more exposed because pauses/noise beds are cleaner.
+- Cleaner joining is still needed even when DeepFilterNet is not used.
+- Silence shortening and adaptive splice mixing should be developed independently from noise removal.
 
-- `validate_filler_report` — clamps indices to [0, word_count), dedupes, filters by confidence, flags `needs_review` if >40% of transcript is flagged
-- `validate_clip_plan` — clamps word indices, **rebuilds startTime/endTime from the transcript's ground truth** (so the exported clip always aligns with real word boundaries), drops clips under 1 s or with <2 words, sorts ascending
-- `validate_focus_plan` — merges overlapping/adjacent ranges, hard-rejects if >80% of transcript would be deleted, flags `needs_review` above 50%
+## Useful Test Files
 
-This is the "seamless guarantee" layer — whatever the model returns, the rest of the pipeline sees clean, clamped, word-indexed data.
+- `tests/video/t1.mp4`: original source
+- `tests/video/t1_edited.mp4`: silence-cut edit without enhancement
+- `tests/video/t1A_edited.mp4`: regenerated enhanced edit for listening tests
+- `tests/video/c8.mp4`: EOF-tail regression source
+- `tests/video/c8_edited*_fixed.mp4`: EOF fixed examples
 
-### Frontend filtering of already-deleted words
+## Near-Term Next Steps
 
-**Important behaviour**: when the user has already deleted ranges before invoking an AI feature, `AIPanel` sends only the **kept** words to the backend (original indices preserved via `keptWordsPayload`). Without this, the AI would re-flag words inside already-deleted spans — "Apply All" would add duplicate ranges and produce no visible change.
-
-This applies to filler, clips, and focus alike. If the user wants to analyze the original full transcript, they clear deletions first via the transcript header's "Clear all" button.
-
-### Clip exports
-
-- Filename format: `{source_basename}_{target_duration}s_{clip_title}_{bucket_index}.mp4` (e.g. `interview_30s_How_We_Built_It_1.mp4`). Title is sanitized (spaces→underscores, illegal chars stripped, ≤50 chars). Index is per-duration so multiple clips of the same duration don't collide.
-- Save location: defaults to the source video's folder; user can override via a persisted picker (`dialog:openDirectory` IPC in Electron).
-- At export, `handleExportClip` intersects the clip's time range with the editor's current `getKeepSegments()` so any in-editor edits (fillers, focus cuts) are honoured, then calls `/export` with the full `words` payload + `deleted_indices`. That's what pipes the clip through the "regular route" — same AcousticMap refinement as a main-dialog export.
-- "Edit" button stages a clip into the editor (deletes everything outside the clip range) so the user can tweak before exporting through the main dialog.
-
-### Focus modes — UX
-
-Five preset buttons: Remove repetition, Tighten pace, Keep key points, Q&A only, Focus on topic. Only *topic* requires free-text input. Results appear as reviewable cuts with confidence pills; each can be applied individually via a check-mark or all at once. Applying converts `FocusDeletion` → `deleteWordRange()` → `DeletedRange` → standard export path.
-
----
-
-## Recent Changes (current session)
-
-### AI layer rewrite
-
-- **New**: `backend/services/ai_validator.py` — Pydantic models + validators that clamp AI output to the transcript's truth (word indices, valid ranges, confidence thresholds, deletion caps).
-- **Rewritten**: `backend/services/ai_provider.py` — every call uses structured output. Prompts restructured into Role/Task/Rules/Output sections. New `focus_transcript()` function. Clip prompt now asks for as many candidates as the material supports (~15 total) across requested durations. Filler prompt is principle-based and multilingual (AI infers language from transcript, no plumbing required).
-- **Updated**: `backend/routers/ai.py` — added `/ai/focus`, added `target_durations: List[int]` to `/ai/create-clip`.
-
-### Frontend AI panel
-
-- Three tabs: Filler / Clips / Focus.
-- Clip duration chips (15/30/60/90, multi-select).
-- Clip save-location picker (persisted per machine via aiStore).
-- Per-duration clip filename (`{source}_{dur}s_{n}.mp4`), previewed in each clip card.
-- Focus mode cards with inline apply / dismiss.
-- Confidence pills and warning banners on every result.
-- AI requests filter out already-deleted words so behaviour matches user expectations.
-
-### Editor
-
-- `editorStore.clearAllDeletions()` — restores every cut.
-- `TranscriptEditor` header gained a "Clear all" button (only visible when cuts exist, confirmation dialog before firing).
-
-### Electron
-
-- New IPC: `dialog:openDirectory` (used by the clip save-location picker).
-
-### Transcription: MLX backend option
-
-- **New**: `backend/services/transcription_mlx.py` — Apple Silicon decode via `mlx-whisper`. Returns segment-level text that the shared `_align_and_pack()` helper feeds into WhisperX's wav2vec2 forced alignment. Timestamps are as precise as the WhisperX path.
-- **New endpoint**: `GET /transcribe/backends` — probes which backends the machine can run (platform + import check) so the UI can disable unavailable options.
-- **App.tsx**: backend selector on the open-file screen. Queries backends at load, auto-falls-back if the saved backend isn't available, and filters the model list per backend (`large-v3-turbo` is MLX-only; `distil-large-v3` is WhisperX-only).
-- **Common install pitfall**: `package.json → dev:backend` hardcodes the venv Python (`/Users/kat/.cutscript-venv/bin/python`). Running plain `pip install mlx-whisper` installs into whatever `pip` is on PATH (often pyenv or system Python), not the venv — so `is_available()` returns `False` even after install. Must use `/Users/kat/.cutscript-venv/bin/pip install mlx-whisper`.
-- **MLX segment-end padding (word clipping fix)**: MLX (like Whisper) emits segment-end timestamps quantized to 20ms tokens that land at the last decoded phoneme position — **not** at the end of the word's acoustic decay (fricative tails, stop releases, nasal murmurs). `whisperx.align()` then clamps every segment's last word boundary to that too-early segment end, clipping the final word of *every segment* and the final word of the video. Fixed in `_transcribe_mlx_with_align` (`transcription.py`): after decode + dedup, every segment's `end` is padded forward by up to 400ms (capped at the next segment's reported start so alignment never crosses into the next segment's first onset), and the last segment's `end` is pushed to the full preprocessed audio duration. An earlier fix only padded the *last* segment and so only helped end-of-video clipping; this version fixes both the video end and the word tails at every inter-segment boundary. Note: existing AcousticMap caches built before this fix will contain stale `we`/`ae` values — clear the spectral cache from Settings after updating to get fresh, correctly-extended word tails.
-
----
-
-## Legacy / fallback refiner
-
-Kept in `_refine_segments` for when no AcousticMap is available. Decision tree:
-
-```
-Is there speech in the INTERIOR of the gap between segments?
-├── YES (deleted words) → onset/decay guided
-│   START: _find_onset_before → backs up 20 ms before detected onset (captures "Sp", "St")
-│         → fallback: 28 ms fixed bias + ZC snap
-│   END:   _find_word_end → scans RMS for natural decay at −25 dB below word peak
-│         → Phase 2: onset of next content if energy stays elevated
-│         → fallback: 28 ms fixed bias + ZC snap
-└── NO (natural pause/breath) → BoundaryRefiner
-    └── Energy onset/decay detection with constrained search window
-
-After all start refinement:
-  → _advance_past_silence: trims leading silence if gap > 250 ms before first speech
-```
-
-Speech threshold: 10th-percentile RMS × 6, adaptive per file.
-
----
-
-## Known Issues / Design Notes
-
-- **On-demand analyze** at export time can add 2-5 s for a long video if the spectral cache was cleared between transcribe and export. Non-fatal — falls back to legacy on any error.
-- **AcousticMap hash collision** isn't protected — if two files somehow map to the same md5(path+size+mtime), the cached map would be stale. Unlikely.
-- **WhisperX re-transcription drift**: when re-transcribing a cut file to verify, word timestamps drift 0.5-1 s from actual positions. This is a WhisperX forced-alignment artifact on short concatenated audio, not an export bug.
-- **Clip filename collisions** across create-clip runs: if the user runs create-clip twice and exports clips with the same duration in both runs, the second run's `_1.mp4` overwrites the first. Clear the results or pick a different save folder between runs.
-
----
-
-## Project Structure
-
-```
-cutscript/
-├── electron/
-│   ├── main.js                          # IPC: dialog:openDirectory, etc.
-│   └── preload.js
-├── frontend/src/
-│   ├── App.tsx                          # open-video modal + /analyze kickoff
-│   ├── components/
-│   │   ├── AIPanel.tsx                  # Filler / Clips / Focus tabs
-│   │   ├── TranscriptEditor.tsx         # Clear-all button in header
-│   │   ├── ExportDialog.tsx
-│   │   ├── SettingsPanel.tsx
-│   │   └── VideoPlayer.tsx
-│   ├── store/
-│   │   ├── editorStore.ts               # clearAllDeletions, getKeepSegments (duration=0 guard)
-│   │   └── aiStore.ts                   # providers, clipDurations, clipSaveLocation, focusPlan
-│   └── types/project.ts                 # FocusPlan, ClipPlan, FillerWordResult
-├── backend/
-│   ├── main.py
-│   ├── routers/
-│   │   ├── ai.py                        # /ai/filler-removal, /ai/create-clip, /ai/focus
-│   │   ├── export.py                    # _refine_from_map (primary) + legacy fallback
-│   │   ├── analysis.py                  # POST /analyze
-│   │   └── cache.py
-│   ├── services/
-│   │   ├── ai_provider.py               # Structured output per provider + prompts
-│   │   ├── ai_validator.py              # Pydantic models + validators (the truth layer)
-│   │   ├── audio_analyzer.py            # AcousticMap
-│   │   ├── boundary_refiner.py
-│   │   ├── transcription.py             # Backend dispatch + shared _align_and_pack()
-│   │   ├── transcription_mlx.py         # Lazy MLX decoder (Apple Silicon)
-│   │   └── video_editor.py
-│   └── utils/
-└── tests/waveform_analysis/             # phase0-phase5 diagnostic + validation scripts
-```
+1. Add "shorten pauses to X ms" instead of only "cut all pauses".
+2. Add backend/export metadata for silence cuts so adaptive splice mode can tell silence joins apart from word joins.
+3. Prototype silence-only crossfade handles.
+4. Add a verification metric for internal splice smoothness: local RMS gap, log-mel discontinuity, and click risk.
+5. Keep Studio Sound optional because it intentionally changes audio character and loudness.
