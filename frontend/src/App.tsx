@@ -36,14 +36,27 @@ export default function App() {
     backendUrl,
   } = useEditorStore();
 
-  const VALID_WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3', 'distil-large-v3'] as const;
-  type WhisperModel = typeof VALID_WHISPER_MODELS[number];
+  const WHISPERX_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3', 'distil-large-v3'] as const;
+  const MLX_MODELS = ['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'] as const;
+  type WhisperBackend = 'whisperx' | 'mlx';
+  type WhisperModel = typeof WHISPERX_MODELS[number] | typeof MLX_MODELS[number];
+
+  type BackendInfo = { id: WhisperBackend; label: string; available: boolean; models: string[]; reason: string };
+  const [backends, setBackends] = useState<BackendInfo[]>([
+    { id: 'whisperx', label: 'WhisperX (faster-whisper)', available: true, models: [...WHISPERX_MODELS], reason: '' },
+    { id: 'mlx', label: 'MLX Whisper (Apple Silicon)', available: false, models: [...MLX_MODELS], reason: 'Checking...' },
+  ]);
+  const [whisperBackend, setWhisperBackend] = useState<WhisperBackend>(() => {
+    const saved = localStorage.getItem('whisperBackend') as WhisperBackend | null;
+    return saved === 'mlx' || saved === 'whisperx' ? saved : 'whisperx';
+  });
 
   const [activePanel, setActivePanel] = useState<Panel>(null);
   const [manualPath, setManualPath] = useState('');
   const [whisperModel, setWhisperModel] = useState<WhisperModel>(() => {
     const saved = localStorage.getItem('whisperModel') as WhisperModel | null;
-    return saved && VALID_WHISPER_MODELS.includes(saved) ? saved : 'base';
+    const union: readonly string[] = [...WHISPERX_MODELS, ...MLX_MODELS];
+    return saved && union.includes(saved) ? (saved as WhisperModel) : 'base';
   });
   const [vocabPrompt, setVocabPrompt] = useState('');
   const [transcribeStatus, setTranscribeStatus] = useState('');
@@ -69,6 +82,45 @@ export default function App() {
       window.electronAPI!.getBackendUrl().then(setBackendUrl);
     }
   }, [setBackendUrl]);
+
+  // Probe which transcription backends are installed. If the user's saved
+  // backend is unavailable (e.g., MLX saved on a machine without it), fall back
+  // to the first available one so the UI can't land in an unrunnable state.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${backendUrl}/transcribe/backends`);
+        if (!res.ok) return;
+        const data: { backends: BackendInfo[] } = await res.json();
+        if (cancelled || !data.backends) return;
+        setBackends(data.backends);
+        setWhisperBackend((current) => {
+          const curInfo = data.backends.find((b) => b.id === current);
+          if (curInfo?.available) return current;
+          const firstAvail = data.backends.find((b) => b.available);
+          return (firstAvail?.id ?? 'whisperx') as WhisperBackend;
+        });
+      } catch {
+        // Backend not reachable yet — leave the optimistic defaults in place.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [backendUrl]);
+
+  // When backend changes, make sure the selected model is actually supported
+  // by that backend. Otherwise the server will reject the transcribe request.
+  useEffect(() => {
+    const info = backends.find((b) => b.id === whisperBackend);
+    if (!info) return;
+    if (!info.models.includes(whisperModel)) {
+      const fallback = (info.models.includes('base') ? 'base' : info.models[0]) as WhisperModel;
+      setWhisperModel(fallback);
+      localStorage.setItem('whisperModel', fallback);
+    }
+  }, [whisperBackend, backends, whisperModel]);
 
   const handleLoadProject = async () => {
     if (!IS_ELECTRON) return;
@@ -132,6 +184,7 @@ export default function App() {
         body: JSON.stringify({
           file_path: path,
           model: whisperModel,
+          backend: whisperBackend,
           initial_prompt: vocabPrompt.trim() || undefined,
           language: language || undefined,
           beam_size: beamSize,
@@ -220,8 +273,31 @@ export default function App() {
           </p>
         </div>
 
-        {/* Whisper model selector + vocabulary prompt */}
+        {/* Whisper backend + model selector + vocabulary prompt */}
         <div className="flex flex-col items-center gap-3 w-full max-w-sm">
+          <div className="flex items-center gap-3 w-full">
+            <label className="text-xs text-editor-text-muted whitespace-nowrap">Backend:</label>
+            <select
+              value={whisperBackend}
+              onChange={(e) => {
+                const v = e.target.value as WhisperBackend;
+                const info = backends.find((b) => b.id === v);
+                if (info && !info.available) {
+                  alert(info.reason || `${info.label} is not available on this machine.`);
+                  return;
+                }
+                setWhisperBackend(v);
+                localStorage.setItem('whisperBackend', v);
+              }}
+              className="flex-1 px-3 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
+            >
+              {backends.map((b) => (
+                <option key={b.id} value={b.id} disabled={!b.available}>
+                  {b.label}{b.available ? '' : ` — ${b.reason || 'unavailable'}`}
+                </option>
+              ))}
+            </select>
+          </div>
           <div className="flex items-center gap-3 w-full">
             <label className="text-xs text-editor-text-muted whitespace-nowrap">Whisper model:</label>
             <select
@@ -233,12 +309,11 @@ export default function App() {
               }}
               className="flex-1 px-3 py-1.5 bg-editor-surface border border-editor-border rounded-lg text-xs text-editor-text focus:outline-none focus:border-editor-accent"
             >
-              <option value="tiny">faster-whisper tiny (~75 MB, fastest)</option>
-              <option value="base">faster-whisper base (~140 MB, fast)</option>
-              <option value="small">faster-whisper small (~460 MB, good)</option>
-              <option value="medium">faster-whisper medium (~1.5 GB, better)</option>
-              <option value="large-v3">faster-whisper large-v3 (~3.1 GB, best, multilingual)</option>
-              <option value="distil-large-v3">faster-whisper distil-large-v3 (~1.6 GB, great + fast)</option>
+              {(backends.find((b) => b.id === whisperBackend)?.models ?? []).map((m) => (
+                <option key={m} value={m}>
+                  {whisperBackend === 'mlx' ? `mlx whisper ${m}` : `faster-whisper ${m}`}
+                </option>
+              ))}
             </select>
           </div>
           <div className="flex flex-col gap-1 w-full">

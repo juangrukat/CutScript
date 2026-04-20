@@ -15,13 +15,15 @@ import torch
 
 
 
-def _make_cache_op(beam_size: int, vad_filter: bool, vad_min_silence_ms: int, verbatim: bool) -> str:
+def _make_cache_op(backend: str, beam_size: int, vad_filter: bool, vad_min_silence_ms: int, verbatim: bool) -> str:
     """
     Build a cache-op string that encodes all variable transcription settings.
     Different combinations produce different hashes so cached results are never
-    reused across setting changes.
+    reused across setting changes. `backend` is part of the key so MLX and
+    WhisperX decodes never collide in cache.
     """
     settings = {
+        "backend": backend,
         "condition_on_previous_text": False,
         "temperature": 0.0,
         "beam_size": beam_size,
@@ -150,6 +152,7 @@ def transcribe_audio(
     vad_filter: bool = False,
     vad_min_silence_ms: int = 500,
     verbatim: bool = False,
+    backend: str = "whisperx",
     progress_cb=None,
 ) -> dict:
     """
@@ -159,7 +162,7 @@ def transcribe_audio(
         dict with keys: words, segments, language
     """
     file_path = Path(file_path)
-    cache_op = _make_cache_op(beam_size, vad_filter, vad_min_silence_ms, verbatim)
+    cache_op = _make_cache_op(backend, beam_size, vad_filter, vad_min_silence_ms, verbatim)
 
     if use_cache:
         cached = load_from_cache(file_path, model_name, cache_op)
@@ -180,22 +183,29 @@ def transcribe_audio(
     preprocessed_path, trim_offset = preprocess_audio_for_transcription(Path(audio_path))
 
     device = _get_device(use_gpu)
-    model = _load_model(model_name, device)
 
     # Determine the actual device for downstream ops (MPS not supported by faster-whisper)
     actual_device = device
     if device.type == "mps":
         actual_device = torch.device("cpu")
 
-    logger.info(f"Transcribing: {file_path}")
+    logger.info(f"Transcribing ({backend}): {file_path}")
 
-    if WHISPERX_AVAILABLE:
+    if backend == "mlx":
+        result = _transcribe_mlx_with_align(
+            str(preprocessed_path), model_name, actual_device,
+            language=language, initial_prompt=initial_prompt,
+            verbatim=verbatim, progress_cb=progress_cb,
+        )
+    elif WHISPERX_AVAILABLE:
+        model = _load_model(model_name, device)
         result = _transcribe_whisperx(
             model, str(preprocessed_path), actual_device, language, initial_prompt,
             beam_size=beam_size, vad_filter=vad_filter, vad_min_silence_ms=vad_min_silence_ms,
             verbatim=verbatim, progress_cb=progress_cb,
         )
     else:
+        model = _load_model(model_name, device)
         if progress_cb:
             progress_cb(10, "Transcribing...")
         result = _transcribe_standard(model, str(preprocessed_path), language, initial_prompt)
@@ -378,6 +388,31 @@ def _transcribe_whisperx(
     if not verbatim:
         segments_for_align = _deduplicate_segments(segments_for_align)
 
+    return _align_and_pack(
+        segments_for_align, audio, detected_language,
+        device=device, verbatim=verbatim, progress_cb=progress_cb,
+    )
+
+
+def _align_and_pack(
+    segments_for_align: list,
+    audio,
+    detected_language: str,
+    device: torch.device,
+    verbatim: bool,
+    progress_cb=None,
+) -> dict:
+    """
+    Run WhisperX wav2vec2 forced alignment on segment-level text and pack the
+    result into the final {words, segments, language} shape.
+
+    Shared between the WhisperX and MLX decode paths so word-timestamp quality
+    is identical regardless of which backend produced the segment text.
+    """
+    def _p(pct: int, status: str):
+        if progress_cb:
+            progress_cb(pct, status)
+
     _p(72, "Aligning words...")
     try:
         align_model, align_metadata = whisperx.load_align_model(
@@ -439,6 +474,50 @@ def _transcribe_whisperx(
         "segments": segments,
         "language": detected_language,
     }
+
+
+def _transcribe_mlx_with_align(
+    audio_path: str,
+    model_name: str,
+    device: torch.device,
+    language: Optional[str] = None,
+    initial_prompt: Optional[str] = None,
+    verbatim: bool = False,
+    progress_cb=None,
+) -> dict:
+    """
+    MLX decode -> WhisperX wav2vec2 alignment.
+
+    MLX handles the Whisper decode (fast on Apple Silicon); WhisperX owns the
+    word-boundary derivation so timestamps stay as precise as the standard path.
+    Requires WhisperX to be installed for the alignment step.
+    """
+    if not WHISPERX_AVAILABLE:
+        raise RuntimeError(
+            "MLX backend requires WhisperX for word alignment. Install whisperx."
+        )
+
+    from services import transcription_mlx
+
+    segments_for_align, detected_language = transcription_mlx.decode(
+        audio_path=audio_path,
+        model_name=model_name,
+        language=language,
+        initial_prompt=initial_prompt,
+        verbatim=verbatim,
+        progress_cb=progress_cb,
+    )
+
+    # In non-verbatim mode the WhisperX path dedupes before alignment; mirror
+    # that so MLX output can't surface chunk-boundary repetition loops.
+    if not verbatim:
+        segments_for_align = _deduplicate_segments(segments_for_align)
+
+    audio = whisperx.load_audio(audio_path)
+    return _align_and_pack(
+        segments_for_align, audio, detected_language,
+        device=device, verbatim=verbatim, progress_cb=progress_cb,
+    )
 
 
 def _transcribe_standard(model, audio_path: str, language: Optional[str], initial_prompt: Optional[str] = None) -> dict:

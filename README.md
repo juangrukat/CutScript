@@ -6,7 +6,7 @@ An open-source, local-first, Descript-style text-based audio and video editor po
 
 ## What you can do with it
 
-- **Transcribe any video or audio file** with word-level timestamps (WhisperX, multilingual).
+- **Transcribe any video or audio file** with word-level timestamps (WhisperX, multilingual). On Apple Silicon, switch to the MLX backend for ~2-3× faster decodes — word boundaries still come from WhisperX's wav2vec2 alignment, so cut quality is unchanged.
 - **Edit by selecting text** — select words, hit Delete, and those spans are cut from the video on export.
 - **Cut seamlessly.** CutScript doesn't just slice at WhisperX timestamps. At ingest, it builds an AcousticMap — per-word fingerprints covering broadband RMS, 2-8 kHz fricative energy, onset/coda phoneme classes, and dip profiles. At export, those fingerprints drive boundary extension so the fricative tail of "Spanish" or the aspirated release of a final "t" stays intact. Zero-crossing snap avoids clicks at splice points.
 - **Detect filler words in any language.** The AI infers the transcript language and applies that language's filler conventions (Spanish "este", French "euh", Japanese "eto", etc). Add custom phrases in any language via the UI.
@@ -21,7 +21,8 @@ An open-source, local-first, Descript-style text-based audio and video editor po
 
 - **Electron + React** desktop app with Tailwind CSS
 - **FastAPI** Python backend (spawned as a child process)
-- **WhisperX** for word-level transcription with alignment
+- **WhisperX** for word-level transcription with alignment (default)
+- **MLX Whisper** optional decoder on Apple Silicon — decodes with MLX, aligns with WhisperX's wav2vec2 for identical timestamp precision
 - **librosa** for audio analysis (AcousticMap ingest-time fingerprinting, RMS-energy boundary refinement, zero-crossing snap)
 - **FFmpeg** for video processing (stream-copy and re-encode, concat + loudnorm)
 - **Ollama / OpenAI / Anthropic** for AI features, all called with **structured output** (JSON-Schema-constrained) and validated through Pydantic models before they touch the edit.
@@ -46,7 +47,12 @@ cd frontend && npm install && cd ..
 
 # Backend dependencies (run from repo root)
 pip install -r requirements.txt
+
+# Optional: MLX Whisper backend (Apple Silicon only)
+pip install mlx-whisper
 ```
+
+The MLX backend is auto-detected at startup: if `mlx-whisper` is importable on an arm64 Mac, the "Backend" dropdown on the open-file screen lights up a second option. Timestamps still route through WhisperX alignment, so there is no change to the seamless-cut pipeline.
 
 ### Run (Development)
 
@@ -106,6 +112,7 @@ cutscript/
 | Feature | Status |
 |---------|--------|
 | Word-level transcription (WhisperX) | Done |
+| MLX Whisper decode backend (Apple Silicon, WhisperX-aligned) | Done |
 | Text-based video editing | Done |
 | Undo/redo | Done |
 | Clear-all cuts (restore transcript) | Done |
@@ -154,8 +161,9 @@ cutscript/
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | /health | Health check |
-| POST | /transcribe | Transcribe video with WhisperX |
+| POST | /transcribe | Transcribe video (WhisperX or MLX backend) |
 | POST | /transcribe/stream | Transcribe with real-time SSE progress |
+| GET | /transcribe/backends | Report which transcription backends are available on this machine |
 | POST | /analyze | Build AcousticMap (per-word spectral fingerprints) |
 | GET | /cache/sizes | Report transcript + spectral cache sizes |
 | POST | /cache/clear/{kind} | Clear `transcripts` or `spectral` cache |

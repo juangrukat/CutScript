@@ -12,11 +12,15 @@ from pydantic import BaseModel, field_validator
 
 from services.transcription import transcribe_audio
 from services.diarization import diarize_and_label
+from services import transcription_mlx
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3", "distil-large-v3"}
+ALLOWED_BACKENDS = {"whisperx", "mlx"}
+ALLOWED_MODELS_WHISPERX = {"tiny", "base", "small", "medium", "large-v3", "distil-large-v3"}
+ALLOWED_MODELS_MLX = set(transcription_mlx.MLX_REPOS.keys())
+ALLOWED_MODELS = ALLOWED_MODELS_WHISPERX | ALLOWED_MODELS_MLX
 ALLOWED_BEAM_SIZES = {1, 3, 5, 8, 10}
 
 
@@ -34,6 +38,14 @@ class TranscribeRequest(BaseModel):
     vad_filter: bool = False
     vad_min_silence_ms: int = 500
     verbatim: bool = False
+    backend: str = "whisperx"
+
+    @field_validator("backend")
+    @classmethod
+    def validate_backend(cls, v: str) -> str:
+        if v not in ALLOWED_BACKENDS:
+            raise ValueError(f"Unknown backend '{v}'. Allowed: {sorted(ALLOWED_BACKENDS)}")
+        return v
 
     @field_validator("model")
     @classmethod
@@ -56,9 +68,45 @@ class TranscribeRequest(BaseModel):
             raise ValueError("vad_min_silence_ms must be between 100 and 2000")
         return v
 
+    def ensure_model_matches_backend(self) -> None:
+        allowed = ALLOWED_MODELS_MLX if self.backend == "mlx" else ALLOWED_MODELS_WHISPERX
+        if self.model not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{self.model}' is not supported by the '{self.backend}' "
+                    f"backend. Allowed for {self.backend}: {sorted(allowed)}"
+                ),
+            )
+
+
+@router.get("/transcribe/backends")
+async def list_backends():
+    """Return which transcription backends are runnable on this machine."""
+    mlx_ok, mlx_reason = transcription_mlx.is_available()
+    return {
+        "backends": [
+            {
+                "id": "whisperx",
+                "label": "WhisperX (faster-whisper)",
+                "available": True,
+                "models": sorted(ALLOWED_MODELS_WHISPERX),
+                "reason": "",
+            },
+            {
+                "id": "mlx",
+                "label": "MLX Whisper (Apple Silicon)",
+                "available": mlx_ok,
+                "models": sorted(ALLOWED_MODELS_MLX),
+                "reason": mlx_reason,
+            },
+        ]
+    }
+
 
 @router.post("/transcribe")
 async def transcribe(req: TranscribeRequest):
+    req.ensure_model_matches_backend()
     try:
         result = transcribe_audio(
             file_path=req.file_path,
@@ -71,6 +119,7 @@ async def transcribe(req: TranscribeRequest):
             vad_filter=req.vad_filter,
             vad_min_silence_ms=req.vad_min_silence_ms,
             verbatim=req.verbatim,
+            backend=req.backend,
         )
 
         if req.diarize and req.hf_token:
@@ -104,6 +153,7 @@ async def transcribe_stream(req: TranscribeRequest):
     Progress values come directly from faster-whisper's lazy segment generator,
     so 10–70% reflects actual decode position in the audio, not an estimate.
     """
+    req.ensure_model_matches_backend()
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -126,6 +176,7 @@ async def transcribe_stream(req: TranscribeRequest):
                 vad_filter=req.vad_filter,
                 vad_min_silence_ms=req.vad_min_silence_ms,
                 verbatim=req.verbatim,
+                backend=req.backend,
                 progress_cb=on_progress,
             )
 

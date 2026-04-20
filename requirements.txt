@@ -32,3 +32,9 @@ deepfilternet>=0.5.0
 
 # Utilities
 pydantic>=2.0.0
+
+# Optional: MLX Whisper backend (Apple Silicon only)
+# Install manually on arm64 macOS for ~2-3× faster Whisper decode:
+#   pip install mlx-whisper
+# Word-level timestamps still come from WhisperX's wav2vec2 alignment, so the
+# cut-refinement pipeline (AcousticMap) is unaffected.

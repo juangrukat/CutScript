@@ -6,7 +6,7 @@ Onboarding notes for a new AI session. Describes the architecture, the edit pipe
 
 ## What CutScript Is
 
-A local-first, Descript-style text-based video editor. The user transcribes a video with WhisperX (word-level timestamps), edits the transcript (delete, filler removal, focus modes, clip extraction), and exports a seamless cut video. Stack: Electron + React frontend, FastAPI Python backend, WhisperX + librosa + FFmpeg. LLM features via Ollama / OpenAI / Anthropic.
+A local-first, Descript-style text-based video editor. The user transcribes a video with WhisperX (word-level timestamps), edits the transcript (delete, filler removal, focus modes, clip extraction), and exports a seamless cut video. Stack: Electron + React frontend, FastAPI Python backend, WhisperX + librosa + FFmpeg. LLM features via Ollama / OpenAI / Anthropic. Optional MLX Whisper decode backend on Apple Silicon (still word-aligned by WhisperX).
 
 ---
 
@@ -18,10 +18,25 @@ This is why everything sounds equally seamless — clips, focus cuts, fillers, m
 
 ---
 
+## Transcription Backends
+
+Two decoder paths converge on the same aligner:
+
+- **WhisperX** (default) — faster-whisper decode + WhisperX wav2vec2 alignment.
+- **MLX Whisper** (optional, Apple Silicon) — `mlx-whisper` decode + WhisperX wav2vec2 alignment. Repos come from `mlx-community/whisper-*` (see `transcription_mlx.MLX_REPOS`).
+
+`backend/services/transcription.py` dispatches on `backend` (`"whisperx" | "mlx"`). Both paths funnel into the shared `_align_and_pack()` helper that runs `whisperx.align()` and produces the final `{words, segments, language}`. **Word-timestamp precision is identical across backends** — only the Whisper decode itself differs.
+
+`backend/services/transcription_mlx.py` is lazily imported: `is_available()` returns `(False, "...")` when MLX isn't runnable (non-arm64 mac or `mlx-whisper` missing). The frontend calls `GET /transcribe/backends` at app load and disables the MLX option accordingly; if the user's saved backend isn't available, it falls back to WhisperX.
+
+The cache key (`_make_cache_op`) includes `backend` so MLX and WhisperX transcripts never collide in `~/.obs_transcriber_cache/`. `distil-large-v3` exists only under WhisperX; `large-v3-turbo` exists only under MLX. The router enforces this per-backend via `ensure_model_matches_backend()`.
+
+---
+
 ## The Cut Pipeline at a Glance
 
 ```
-open video → WhisperX transcribe → /analyze builds AcousticMap (cached)
+open video → WhisperX or MLX transcribe → /analyze builds AcousticMap (cached)
                                        │
                                        ▼
 edit in UI (manual / filler / focus / clip) → getKeepSegments()  →  /export
