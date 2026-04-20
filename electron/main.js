@@ -90,6 +90,14 @@ ipcMain.handle('dialog:saveFile', async (_event, options) => {
   return result.canceled ? null : result.filePath;
 });
 
+ipcMain.handle('dialog:openDirectory', async (_event, options) => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory', 'createDirectory'],
+    ...options,
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+
 ipcMain.handle('dialog:openProject', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openFile'],

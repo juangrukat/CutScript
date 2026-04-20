@@ -1,8 +1,16 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { AIProvider, AIProviderConfig, FillerWordResult, ClipSuggestion } from '../types/project';
+import type {
+  AIProvider,
+  AIProviderConfig,
+  ClipSuggestion,
+  FillerWordResult,
+  FocusPlan,
+} from '../types/project';
 
 const ENCRYPTED_KEY_PREFIX = 'aive_enc_';
+
+export type ClipDuration = 15 | 30 | 60 | 90;
 
 interface AIState {
   providers: Record<AIProvider, AIProviderConfig>;
@@ -10,6 +18,11 @@ interface AIState {
   customFillerWords: string;
   fillerResult: FillerWordResult | null;
   clipSuggestions: ClipSuggestion[];
+  clipRationale: string;
+  clipWarnings: string[];
+  clipDurations: ClipDuration[];
+  clipSaveLocation: string | null;
+  focusPlan: FocusPlan | null;
   isProcessing: boolean;
   processingMessage: string;
   _keysHydrated: boolean;
@@ -20,7 +33,10 @@ interface AIActions {
   setDefaultProvider: (provider: AIProvider) => void;
   setCustomFillerWords: (words: string) => void;
   setFillerResult: (result: FillerWordResult | null) => void;
-  setClipSuggestions: (suggestions: ClipSuggestion[]) => void;
+  setClipResult: (clips: ClipSuggestion[], rationale?: string, warnings?: string[]) => void;
+  setClipDurations: (durations: ClipDuration[]) => void;
+  setClipSaveLocation: (location: string | null) => void;
+  setFocusPlan: (plan: FocusPlan | null) => void;
   setProcessing: (active: boolean, message?: string) => void;
   hydrateKeys: () => Promise<void>;
 }
@@ -67,6 +83,11 @@ export const useAIStore = create<AIState & AIActions>()(
       customFillerWords: '',
       fillerResult: null,
       clipSuggestions: [],
+      clipRationale: '',
+      clipWarnings: [],
+      clipDurations: [60],
+      clipSaveLocation: null,
+      focusPlan: null,
       isProcessing: false,
       processingMessage: '',
       _keysHydrated: false,
@@ -78,20 +99,19 @@ export const useAIStore = create<AIState & AIActions>()(
             [provider]: { ...state.providers[provider], ...config },
           },
         }));
-
         if (config.apiKey !== undefined) {
           encryptAndStore(`${provider}_apiKey`, config.apiKey);
         }
       },
 
       setDefaultProvider: (provider) => set({ defaultProvider: provider }),
-
       setCustomFillerWords: (words) => set({ customFillerWords: words }),
-
       setFillerResult: (result) => set({ fillerResult: result }),
-
-      setClipSuggestions: (suggestions) => set({ clipSuggestions: suggestions }),
-
+      setClipResult: (clips, rationale = '', warnings = []) =>
+        set({ clipSuggestions: clips, clipRationale: rationale, clipWarnings: warnings }),
+      setClipDurations: (durations) => set({ clipDurations: durations.length ? durations : [60] }),
+      setClipSaveLocation: (location) => set({ clipSaveLocation: location }),
+      setFocusPlan: (plan) => set({ focusPlan: plan }),
       setProcessing: (active, message) =>
         set({ isProcessing: active, processingMessage: message ?? '' }),
 
@@ -121,6 +141,8 @@ export const useAIStore = create<AIState & AIActions>()(
         },
         defaultProvider: state.defaultProvider,
         customFillerWords: state.customFillerWords,
+        clipDurations: state.clipDurations,
+        clipSaveLocation: state.clipSaveLocation,
       }),
     },
   ),

@@ -1,12 +1,20 @@
 # CutScript — AI Session Context
 
-Onboarding notes for a new AI session. Describes the architecture, the acoustic-analysis pipeline, and the most recent changes.
+Onboarding notes for a new AI session. Describes the architecture, the edit pipeline, and the latest AI-layer rework.
 
 ---
 
 ## What CutScript Is
 
-A local-first, Descript-style text-based video editor. The user transcribes a video with WhisperX (word-level timestamps), deletes words from the transcript, and exports a cut video where those words have been removed. Stack: Electron + React frontend, FastAPI Python backend, WhisperX + librosa + FFmpeg.
+A local-first, Descript-style text-based video editor. The user transcribes a video with WhisperX (word-level timestamps), edits the transcript (delete, filler removal, focus modes, clip extraction), and exports a seamless cut video. Stack: Electron + React frontend, FastAPI Python backend, WhisperX + librosa + FFmpeg. LLM features via Ollama / OpenAI / Anthropic.
+
+---
+
+## The One Truth: Word-Index Ranges
+
+Every edit — manual selection, filler removal, focus plan, clip extraction — converges on **word-index ranges in the transcript**. These become `DeletedRange` objects in the editor store. `getKeepSegments()` turns them into time ranges, `/export` feeds them to `_refine_from_map` (AcousticMap-guided), ffmpeg concat+loudnorm produces the final cut.
+
+This is why everything sounds equally seamless — clips, focus cuts, fillers, manual edits all traverse the same refinement pipeline.
 
 ---
 
@@ -16,14 +24,14 @@ A local-first, Descript-style text-based video editor. The user transcribes a vi
 open video → WhisperX transcribe → /analyze builds AcousticMap (cached)
                                        │
                                        ▼
-delete words in UI  →  getKeepSegments()  →  /export
+edit in UI (manual / filler / focus / clip) → getKeepSegments()  →  /export
                                        │
                                        ▼
   extract PCM WAV → _refine_from_map (AcousticMap-guided)  → ffmpeg trim+concat+loudnorm
                    (or _refine_segments fallback if map missing)
 ```
 
-Two independent caches on disk, both cleanable from the Settings panel:
+Two disk caches, both cleanable from the Settings panel:
 
 - `~/.obs_transcriber_cache/<hash>_<model>_transcribe_wx_*.json` — WhisperX results
 - `~/.cutscript_spectral_cache/<hash>.json` — AcousticMap fingerprints
@@ -32,77 +40,97 @@ File hash = md5(path + size + mtime).
 
 ---
 
-## AcousticMap (the current refinement primary)
+## AcousticMap (refinement primary)
 
 Built at ingest time by `POST /analyze` and consumed at export time by `_refine_from_map`. Lives in `backend/services/audio_analyzer.py`.
 
-**Per-word `WordFingerprint`:**
-- `ws`, `we` — WhisperX start/end
-- `as_`, `ae` — **acoustic** start/end (these are what the refiner uses)
-- `onset`, `coda` — phoneme class (`fricative` / `stop` / `nasal` / `vowel` / `approximant`) inferred from spelling
-- `peak_rms`, `peak_fric` — broadband and 2–8 kHz fricative-band peaks inside the word
-- `dips` — intraword RMS dips (tracks word-internal silences so we don't split on them)
+**Per-word `WordFingerprint`:** WhisperX start/end (`ws`/`we`), **acoustic** start/end (`as_`/`ae` — these are the refined boundaries), onset/coda phoneme classes (fricative/stop/nasal/vowel/approximant), `peak_rms`, `peak_fric` (2-8 kHz), intraword `dips`.
 
-**Coda-specific decay policies** control how far `ae` extends past `we`:
-- fricative (`sh`, `s`, `f`, `th`) — band+broadband both-below (captures the /ʃ/ tail in "Spanish")
-- nasal (`n`, `m`) — −18 dB decay
-- stop (`p`, `t`, `k`) — −20 dB decay
-- vowel / approximant — −25 dB decay
+**Coda-specific decay policies** in `_refine_from_map` control how far `ae` extends past `we`: fricative tails get band+broadband both-below; nasals/stops/vowels use tiered dB thresholds (-18/-20/-25). Clamps to audio duration; drops any segment <10 ms.
 
-**`_refine_from_map` (backend/routers/export.py)**:
-- Matches each segment endpoint to a WordFingerprint within 100 ms
-- Uses `word.as_` / `word.ae` as the refined boundary (clamped by the neighbouring segment)
-- Zero-crossing snap
-- **Clamps to audio duration** — ffmpeg cannot see a segment that extends past EOF
-- **Drops any segment shorter than 10 ms** — empty atrim silently truncates concat output
-
-The legacy `_refine_segments` is kept as a fallback (used if the map is missing *and* on-demand `analyze_file` fails). Same clamp/drop safety applied.
+Legacy `_refine_segments` kept only as a fallback (same safety clamps).
 
 ---
 
-## Recent Changes
+## AI Layer — current architecture
 
-### "Is there a problem?" dropped from exports — fixed
+Three features, one pipeline:
 
-Symptom: `b_edited1.mp4` was 7.5 s and ended after "Okay, time to go." Last kept segment (words 76–79) was missing.
+| Feature | Endpoint | Output |
+|---|---|---|
+| Filler detection (multilingual) | `POST /ai/filler-removal` | `FillerReport` |
+| Clip candidates (multi-duration) | `POST /ai/create-clip` | `ClipPlan` |
+| Focus modes (redundancy/tighten/key_points/qa_extract/topic) | `POST /ai/focus` | `FocusPlan` |
 
-Reproduced the full pipeline end-to-end in `tests/waveform_analysis/phase5_last_segment.py` — both refiners produced the correct 11.6 s output with all 7 segments. Pipeline was fine. Bug was in the UI.
+### Structured output
 
-**Root cause:** `getKeepSegments` in `frontend/src/store/editorStore.ts` seeded its last-segment padding reducer with `duration`:
-```ts
-.reduce((min, r) => Math.min(min, r.start), duration);
-lastSeg.end = Math.min(nextDeletedStart, lastSeg.end + 1.5);
-```
-When video metadata hadn't loaded yet, `duration === 0` → `nextDeletedStart = 0` → `lastSeg.end = 0`. The last segment silently became `(46.7, 0)`, which ffmpeg's `atrim` treated as empty and concat dropped it.
+Every call uses **native constrained decoding**:
 
-**Fix:** seed with `Infinity` and apply a duration cap only when duration is known:
-```ts
-.reduce((min, r) => Math.min(min, r.start), Infinity);
-const durationCap = duration > 0 ? duration : Infinity;
-lastSeg.end = Math.min(nextDeletedStart, durationCap, lastSeg.end + 1.5);
-```
+- **OpenAI**: `response_format={"type": "json_schema", "json_schema": {..., "strict": True}}`. The helper `_strictify_schema` in `ai_provider.py` transforms Pydantic schemas by adding `additionalProperties: false`, marking every field required, stripping `default` and `title`.
+- **Anthropic**: forced tool-use. A virtual tool is invented with `input_schema = <Pydantic schema>`, `tool_choice` forces the tool, we read `tool_use.input`.
+- **Ollama**: `format: <schema>` (Ollama 0.5+). Falls back to brace-extract if validation fails.
 
-**Defensive backend guards** added alongside:
-- `_refine_from_map` and `_refine_segments` clamp every boundary to `[0, audio_dur]`
-- Segments shorter than 10 ms are dropped with a warning before reaching ffmpeg
+Every response goes through `response_model.model_validate(raw)` (Pydantic). The old "find the first `{`" parser is only used as a last resort if JSON decoding fails outright.
 
-### AcousticMap pipeline shipped
+### The shared validator
 
-Full five-phase plan completed. Key files:
+`backend/services/ai_validator.py` owns all the Pydantic models and per-feature validators:
 
-- `backend/services/audio_analyzer.py` — new. `AcousticMap`, `WordFingerprint`, `analyze_file`, `_fricative_band_rms`, `_classify_onset/coda`, `_analyze_word`, persistence helpers.
-- `backend/routers/analysis.py` — new. `POST /analyze { file_path, words } → { status, file_hash, words, cached }`.
-- `backend/routers/cache.py` — new. `GET /cache/sizes`, `POST /cache/clear/{transcripts|spectral}`.
-- `backend/routers/export.py` — added `_refine_from_map`. `export_video` now: `load_acoustic_map → analyze_file on demand if missing → _refine_from_map → legacy fallback on error`.
-- `frontend/src/App.tsx` — posts to `/analyze` after transcription completes (progress 98% → 100%, non-fatal on failure).
-- `frontend/src/components/ExportDialog.tsx` — always sends `words` so the backend can rebuild the map on demand if cache was cleared between transcribe and export.
-- `frontend/src/components/SettingsPanel.tsx` — new `CacheManager` component with size + file-count rows for both caches and independent Clear buttons.
+- `validate_filler_report` — clamps indices to [0, word_count), dedupes, filters by confidence, flags `needs_review` if >40% of transcript is flagged
+- `validate_clip_plan` — clamps word indices, **rebuilds startTime/endTime from the transcript's ground truth** (so the exported clip always aligns with real word boundaries), drops clips under 1 s or with <2 words, sorts ascending
+- `validate_focus_plan` — merges overlapping/adjacent ranges, hard-rejects if >80% of transcript would be deleted, flags `needs_review` above 50%
 
-Validated against the "Spanish?" truncation bug that originally motivated this work: Phase 0 ground truth measured the /ʃ/ tail extending ~310 ms past WhisperX's `we`. `tests/waveform_analysis/phase5_validate.py` reports `coda extension: 288 ms — PASS`.
+This is the "seamless guarantee" layer — whatever the model returns, the rest of the pipeline sees clean, clamped, word-indexed data.
+
+### Frontend filtering of already-deleted words
+
+**Important behaviour**: when the user has already deleted ranges before invoking an AI feature, `AIPanel` sends only the **kept** words to the backend (original indices preserved via `keptWordsPayload`). Without this, the AI would re-flag words inside already-deleted spans — "Apply All" would add duplicate ranges and produce no visible change.
+
+This applies to filler, clips, and focus alike. If the user wants to analyze the original full transcript, they clear deletions first via the transcript header's "Clear all" button.
+
+### Clip exports
+
+- Filename format: `{source_basename}_{target_duration}s_{bucket_index}.mp4` (e.g. `a_30s_1.mp4`). Index is per-duration so multiple 30 s clips don't collide with each other.
+- Save location: defaults to the source video's folder; user can override via a persisted picker (`dialog:openDirectory` IPC in Electron).
+- At export, `handleExportClip` intersects the clip's time range with the editor's current `getKeepSegments()` so any in-editor edits (fillers, focus cuts) are honoured, then calls `/export` with the full `words` payload + `deleted_indices`. That's what pipes the clip through the "regular route" — same AcousticMap refinement as a main-dialog export.
+- "Edit" button stages a clip into the editor (deletes everything outside the clip range) so the user can tweak before exporting through the main dialog.
+
+### Focus modes — UX
+
+Five preset buttons: Remove repetition, Tighten pace, Keep key points, Q&A only, Focus on topic. Only *topic* requires free-text input. Results appear as reviewable cuts with confidence pills; each can be applied individually via a check-mark or all at once. Applying converts `FocusDeletion` → `deleteWordRange()` → `DeletedRange` → standard export path.
 
 ---
 
-## Legacy Refiner (fallback only)
+## Recent Changes (current session)
+
+### AI layer rewrite
+
+- **New**: `backend/services/ai_validator.py` — Pydantic models + validators that clamp AI output to the transcript's truth (word indices, valid ranges, confidence thresholds, deletion caps).
+- **Rewritten**: `backend/services/ai_provider.py` — every call uses structured output. Prompts restructured into Role/Task/Rules/Output sections. New `focus_transcript()` function. Clip prompt now asks for as many candidates as the material supports (~15 total) across requested durations. Filler prompt is principle-based and multilingual (AI infers language from transcript, no plumbing required).
+- **Updated**: `backend/routers/ai.py` — added `/ai/focus`, added `target_durations: List[int]` to `/ai/create-clip`.
+
+### Frontend AI panel
+
+- Three tabs: Filler / Clips / Focus.
+- Clip duration chips (15/30/60/90, multi-select).
+- Clip save-location picker (persisted per machine via aiStore).
+- Per-duration clip filename (`{source}_{dur}s_{n}.mp4`), previewed in each clip card.
+- Focus mode cards with inline apply / dismiss.
+- Confidence pills and warning banners on every result.
+- AI requests filter out already-deleted words so behaviour matches user expectations.
+
+### Editor
+
+- `editorStore.clearAllDeletions()` — restores every cut.
+- `TranscriptEditor` header gained a "Clear all" button (only visible when cuts exist, confirmation dialog before firing).
+
+### Electron
+
+- New IPC: `dialog:openDirectory` (used by the clip save-location picker).
+
+---
+
+## Legacy / fallback refiner
 
 Kept in `_refine_segments` for when no AcousticMap is available. Decision tree:
 
@@ -123,54 +151,14 @@ After all start refinement:
 
 Speech threshold: 10th-percentile RMS × 6, adaptive per file.
 
-Helpers (all in `export.py`): `_gap_has_speech`, `_snap_zc`, `_sample_has_speech`, `_find_onset_before`, `_find_word_end`, `_advance_past_silence`.
-
 ---
 
 ## Known Issues / Design Notes
 
-- **`duration === 0` case** is now handled, but relies on the video element emitting `onLoadedMetadata` before the user exports. The backend clamps provide a second line of defence.
-- **AcousticMap hash collision** isn't protected — if two different files somehow map to the same hash (path+size+mtime md5), the cached map would be wrong. Unlikely but possible.
-- **On-demand analyze** at export time can add 2–5 s for a long video if the spectral cache was cleared. Non-fatal — falls back to legacy on any error.
-- **`_advance_past_silence`'s 250 ms threshold** may need tuning for languages with unusually long voiceless onset clusters.
-- **WhisperX re-transcription drift**: when re-transcribing a cut file to verify, word timestamps drift 0.5–1 s from actual positions. This is a WhisperX forced-alignment artifact on short concatenated audio, not an export bug.
-
----
-
-## Files Changed in Recent Sessions
-
-### "Is there a problem?" fix + README/AI_CONTEXT sync
-
-| File | Change |
-|---|---|
-| `frontend/src/store/editorStore.ts` | Fixed `getKeepSegments` last-seg padding collapse when `duration === 0` |
-| `backend/routers/export.py` | Clamp refined boundaries to audio duration; drop <10 ms segments in both refiners |
-| `README.md` | Added AcousticMap rows and `/analyze`, `/cache/*` endpoints |
-| `AI_CONTEXT.md` | This rewrite |
-
-### AcousticMap pipeline
-
-| File | Change |
-|---|---|
-| `backend/services/audio_analyzer.py` | New — AcousticMap, WordFingerprint, analyze_file, persistence |
-| `backend/routers/analysis.py` | New — `POST /analyze` |
-| `backend/routers/cache.py` | New — size + per-kind clear endpoints |
-| `backend/routers/export.py` | Added `_refine_from_map`; on-demand rebuild; legacy fallback |
-| `backend/main.py` | Mounted `analysis` and `cache` routers |
-| `frontend/src/App.tsx` | Post-transcription `/analyze` call |
-| `frontend/src/components/ExportDialog.tsx` | Always send `words` |
-| `frontend/src/components/SettingsPanel.tsx` | Added `CacheManager` UI |
-| `tests/waveform_analysis/phase5_validate.py` | New — validates /ʃ/ tail preservation |
-| `tests/waveform_analysis/phase5_last_segment.py` | New — 7-segment end-to-end reproduction |
-| `tests/waveform_analysis/phase5_legacy.py` | New — same scenario against legacy refiner |
-
-### Earlier (hissing + onset clusters)
-
-| File | Change |
-|---|---|
-| `backend/routers/export.py` | `_advance_past_silence`; `_find_onset_before`; `_find_word_end`; `_gap_has_speech` |
-| `backend/services/boundary_refiner.py` | Copied from `rosa/` |
-| `backend/services/transcription.py` | Removed hallucination-prone `initial_prompt`; added `_clip_to_duration` |
+- **On-demand analyze** at export time can add 2-5 s for a long video if the spectral cache was cleared between transcribe and export. Non-fatal — falls back to legacy on any error.
+- **AcousticMap hash collision** isn't protected — if two files somehow map to the same md5(path+size+mtime), the cached map would be stale. Unlikely.
+- **WhisperX re-transcription drift**: when re-transcribing a cut file to verify, word timestamps drift 0.5-1 s from actual positions. This is a WhisperX forced-alignment artifact on short concatenated audio, not an export bug.
+- **Clip filename collisions** across create-clip runs: if the user runs create-clip twice and exports clips with the same duration in both runs, the second run's `_1.mp4` overwrites the first. Clear the results or pick a different save folder between runs.
 
 ---
 
@@ -179,30 +167,34 @@ Helpers (all in `export.py`): `_gap_has_speech`, `_snap_zc`, `_sample_has_speech
 ```
 cutscript/
 ├── electron/
+│   ├── main.js                          # IPC: dialog:openDirectory, etc.
+│   └── preload.js
 ├── frontend/src/
 │   ├── App.tsx                          # open-video modal + /analyze kickoff
 │   ├── components/
-│   │   ├── ExportDialog.tsx             # sends words + deleted_indices
-│   │   ├── SettingsPanel.tsx            # CacheManager lives here
-│   │   └── TranscriptEditor.tsx
+│   │   ├── AIPanel.tsx                  # Filler / Clips / Focus tabs
+│   │   ├── TranscriptEditor.tsx         # Clear-all button in header
+│   │   ├── ExportDialog.tsx
+│   │   ├── SettingsPanel.tsx
+│   │   └── VideoPlayer.tsx
 │   ├── store/
-│   │   └── editorStore.ts               # getKeepSegments — duration=0 guard here
-│   └── hooks/
+│   │   ├── editorStore.ts               # clearAllDeletions, getKeepSegments (duration=0 guard)
+│   │   └── aiStore.ts                   # providers, clipDurations, clipSaveLocation, focusPlan
+│   └── types/project.ts                 # FocusPlan, ClipPlan, FillerWordResult
 ├── backend/
-│   ├── main.py                          # mounts analysis + cache routers
+│   ├── main.py
 │   ├── routers/
+│   │   ├── ai.py                        # /ai/filler-removal, /ai/create-clip, /ai/focus
 │   │   ├── export.py                    # _refine_from_map (primary) + legacy fallback
 │   │   ├── analysis.py                  # POST /analyze
-│   │   └── cache.py                     # GET /cache/sizes, POST /cache/clear/{kind}
+│   │   └── cache.py
 │   ├── services/
-│   │   ├── audio_analyzer.py            # AcousticMap, WordFingerprint, analyze_file
+│   │   ├── ai_provider.py               # Structured output per provider + prompts
+│   │   ├── ai_validator.py              # Pydantic models + validators (the truth layer)
+│   │   ├── audio_analyzer.py            # AcousticMap
 │   │   ├── boundary_refiner.py
 │   │   ├── transcription.py
-│   │   └── video_editor.py              # ffmpeg trim+concat+loudnorm
+│   │   └── video_editor.py
 │   └── utils/
-│       ├── audio_processing.py
-│       └── cache.py                     # get_file_hash
-├── rosa/
-└── tests/
-    └── waveform_analysis/               # phase0–phase5 diagnostic + validation scripts
+└── tests/waveform_analysis/             # phase0-phase5 diagnostic + validation scripts
 ```

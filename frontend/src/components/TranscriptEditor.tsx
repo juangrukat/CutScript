@@ -1,7 +1,7 @@
 import { useCallback, useRef, useEffect, useMemo, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { Virtuoso } from 'react-virtuoso';
-import { Trash2, RotateCcw } from 'lucide-react';
+import { Trash2, RotateCcw, Eraser } from 'lucide-react';
 
 export default function TranscriptEditor() {
   const words = useEditorStore((s) => s.words);
@@ -13,6 +13,7 @@ export default function TranscriptEditor() {
   const setHoveredWordIndex = useEditorStore((s) => s.setHoveredWordIndex);
   const deleteSelectedWords = useEditorStore((s) => s.deleteSelectedWords);
   const restoreRange = useEditorStore((s) => s.restoreRange);
+  const clearAllDeletions = useEditorStore((s) => s.clearAllDeletions);
   const getWordAtTime = useEditorStore((s) => s.getWordAtTime);
 
   const selectionStart = useRef<number | null>(null);
@@ -185,6 +186,18 @@ export default function TranscriptEditor() {
           >
             <Trash2 className="w-3 h-3" />
             Delete {selectedWordIndices.length} words
+          </button>
+        )}
+        {deletedRanges.length > 0 && (
+          <button
+            onClick={() => {
+              if (window.confirm(`Restore all ${deletedRanges.length} cuts?`)) clearAllDeletions();
+            }}
+            className="flex items-center gap-1 px-2 py-1 text-xs bg-editor-border text-editor-text-muted rounded hover:bg-editor-surface transition-colors"
+            title="Restore every deleted word"
+          >
+            <Eraser className="w-3 h-3" />
+            Clear all
           </button>
         )}
       </div>

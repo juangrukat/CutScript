@@ -37,6 +37,7 @@ interface EditorActions {
   deleteSelectedWords: () => void;
   deleteWordRange: (startIndex: number, endIndex: number) => void;
   restoreRange: (rangeId: string) => void;
+  clearAllDeletions: () => void;
   setTranscribing: (active: boolean, progress?: number) => void;
   setExporting: (active: boolean, progress?: number) => void;
   getKeepSegments: () => Array<{ start: number; end: number }>;
@@ -146,6 +147,8 @@ export const useEditorStore = create<EditorState & EditorActions>()(
         const { deletedRanges } = get();
         set({ deletedRanges: deletedRanges.filter((r) => r.id !== rangeId) });
       },
+
+      clearAllDeletions: () => set({ deletedRanges: [], selectedWordIndices: [] }),
 
       setTranscribing: (active, progress) =>
         set({

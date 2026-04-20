@@ -71,9 +71,19 @@ export interface AIProviderConfig {
   model: string;
 }
 
+export interface FillerWord {
+  index: number;
+  word: string;
+  reason: string;
+  confidence: number;
+}
+
 export interface FillerWordResult {
+  language?: string;
   wordIndices: number[];
-  fillerWords: Array<{ index: number; word: string; reason: string }>;
+  fillerWords: FillerWord[];
+  needs_review?: boolean;
+  warnings?: string[];
 }
 
 export interface ClipSuggestion {
@@ -83,4 +93,30 @@ export interface ClipSuggestion {
   startTime: number;
   endTime: number;
   reason: string;
+  confidence: number;
+  target_duration: number;
+}
+
+export interface ClipPlan {
+  clips: ClipSuggestion[];
+  rationale?: string;
+  needs_review?: boolean;
+  warnings?: string[];
+}
+
+export type FocusMode = 'redundancy' | 'tighten' | 'topic' | 'qa_extract' | 'key_points';
+
+export interface FocusDeletion {
+  startIndex: number;
+  endIndex: number;
+  reason: string;
+  confidence: number;
+}
+
+export interface FocusPlan {
+  mode: FocusMode | string;
+  deletions: FocusDeletion[];
+  summary?: string;
+  needs_review?: boolean;
+  warnings?: string[];
 }

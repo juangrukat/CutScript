@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electronAPI', {
   openFile: (options) => ipcRenderer.invoke('dialog:openFile', options),
   saveFile: (options) => ipcRenderer.invoke('dialog:saveFile', options),
+  openDirectory: (options) => ipcRenderer.invoke('dialog:openDirectory', options),
   openProject: () => ipcRenderer.invoke('dialog:openProject'),
   getBackendUrl: () => ipcRenderer.invoke('get-backend-url'),
   encryptString: (data) => ipcRenderer.invoke('safe-storage:encrypt', data),

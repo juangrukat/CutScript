@@ -1,18 +1,30 @@
 # CutScript
 
-An open-source, local-first, Descript-like text-based audio and video editor powered by AI. Edit audio/video by editing text — delete a word from the transcript and it's cut from the audio/video.
+An open-source, local-first, Descript-style text-based audio and video editor powered by AI. Edit by editing text — delete a word from the transcript and it disappears from the video. Seamless cuts via acoustic-map–guided boundary refinement.
 
 <img width="1034" height="661" alt="image" src="https://github.com/user-attachments/assets/b1ed9505-792e-42ca-bb73-85458d0f02a5" />
 
+## What you can do with it
+
+- **Transcribe any video or audio file** with word-level timestamps (WhisperX, multilingual).
+- **Edit by selecting text** — select words, hit Delete, and those spans are cut from the video on export.
+- **Cut seamlessly.** CutScript doesn't just slice at WhisperX timestamps. At ingest, it builds an AcousticMap — per-word fingerprints covering broadband RMS, 2-8 kHz fricative energy, onset/coda phoneme classes, and dip profiles. At export, those fingerprints drive boundary extension so the fricative tail of "Spanish" or the aspirated release of a final "t" stays intact. Zero-crossing snap avoids clicks at splice points.
+- **Detect filler words in any language.** The AI infers the transcript language and applies that language's filler conventions (Spanish "este", French "euh", Japanese "eto", etc). Add custom phrases in any language via the UI.
+- **Generate social-ready clips.** Point it at a long video, pick one or more target durations (15/30/60/90s), and get back as many candidate clips as the material supports — each with a confidence score, a reason, and a predictable filename (`source_30s_1.mp4`). Clips can be quick-exported, loaded back into the editor for tweaking, or batch-exported to a folder you choose.
+- **Focus modes.** Reshape long-form content with one click: *Remove repetition*, *Tighten pace*, *Keep key points*, *Q&A only*, or *Focus on topic* (free-text). Each mode returns a reviewable plan — you approve cuts individually or in bulk before they touch the edit.
+- **Burn captions.** Word-level SRT/VTT/ASS generation; burn-in supported on export.
+- **Clean up audio.** Studio Sound (DeepFilterNet) noise reduction on export.
+- **Work offline.** Ollama support means the whole pipeline can run locally with no cloud dependency.
+- **Bring your own model.** OpenAI (structured outputs via `json_schema`), Anthropic (structured outputs via forced tool-use), and Ollama (JSON-schema `format`). API keys are stored in the OS keychain.
 
 ## Architecture
 
 - **Electron + React** desktop app with Tailwind CSS
-- **FastAPI** Python backend (spawned as child process)
+- **FastAPI** Python backend (spawned as a child process)
 - **WhisperX** for word-level transcription with alignment
-- **librosa** for audio boundary refinement (natural splice-point detection, interior gap speech detection, zero-crossing snap)
-- **FFmpeg** for video processing (stream-copy and re-encode)
-- **Ollama / OpenAI / Claude** for AI features (filler removal, clip creation)
+- **librosa** for audio analysis (AcousticMap ingest-time fingerprinting, RMS-energy boundary refinement, zero-crossing snap)
+- **FFmpeg** for video processing (stream-copy and re-encode, concat + loudnorm)
+- **Ollama / OpenAI / Anthropic** for AI features, all called with **structured output** (JSON-Schema-constrained) and validated through Pydantic models before they touch the edit.
 
 ## Quick Start
 
@@ -39,11 +51,11 @@ pip install -r requirements.txt
 ### Run (Development)
 
 ```bash
-# Start all three (backend + frontend + electron)
+# Backend + frontend + electron
 npm run dev
 ```
 
-Or run them separately:
+Or separately:
 
 ```bash
 # Terminal 1: Backend
@@ -56,26 +68,37 @@ cd frontend && npm run dev
 npx electron .
 ```
 
+## How the edit pipeline works
+
+```
+open video → WhisperX transcribe → /analyze builds AcousticMap (cached)
+                                       │
+                                       ▼
+edit in UI (delete / filler / focus / clip) → getKeepSegments()  →  /export
+                                       │
+                                       ▼
+   extract PCM WAV → _refine_from_map (AcousticMap-guided)  → ffmpeg trim+concat+loudnorm
+```
+
+Every AI feature converges on the **same truth**: word-index ranges in the transcript. The AI produces a plan, the validator clamps it to valid ranges, the editor store turns it into `DeletedRange` objects, and export runs through the normal refinement pipeline. That's why clips, focus cuts, and manual edits all sound equally seamless.
+
 ## Project Structure
 
 ```
 cutscript/
-├── electron/          # Electron main process
-│   ├── main.js        # App entry, spawns Python backend
-│   ├── preload.js     # Secure IPC bridge
-│   └── python-bridge.js
+├── electron/          # Electron main + IPC bridge
 ├── frontend/          # React + Vite + Tailwind
 │   └── src/
-│       ├── components/  # VideoPlayer, TranscriptEditor, etc.
-│       ├── store/       # Zustand state (editorStore, aiStore)
-│       ├── hooks/       # useVideoSync, useKeyboardShortcuts
+│       ├── components/  # VideoPlayer, TranscriptEditor, AIPanel, ExportDialog
+│       ├── store/       # Zustand: editorStore, aiStore
 │       └── types/       # TypeScript interfaces
-├── backend/           # FastAPI Python backend
-│   ├── main.py
-│   ├── routers/       # API endpoints
-│   ├── services/      # Core logic (transcription, editing, AI)
-│   └── utils/         # GPU, cache, audio helpers
-└── shared/            # Project schema
+├── backend/           # FastAPI
+│   ├── routers/       # transcribe, analyze, export, ai, captions, audio, cache
+│   ├── services/      # transcription, audio_analyzer, video_editor,
+│   │                  # ai_provider (structured output), ai_validator (Pydantic),
+│   │                  # boundary_refiner, caption_generator, audio_cleaner
+│   └── utils/         # gpu, cache, audio_processing
+└── tests/waveform_analysis/   # phase0-phase5 diagnostic scripts
 ```
 
 ## Features
@@ -85,18 +108,19 @@ cutscript/
 | Word-level transcription (WhisperX) | Done |
 | Text-based video editing | Done |
 | Undo/redo | Done |
+| Clear-all cuts (restore transcript) | Done |
 | Waveform timeline | Done |
 | FFmpeg stream-copy export | Done |
 | FFmpeg re-encode (up to 4K) | Done |
 | Seamless audio cuts (boundary fades + loudness normalization) | Done |
-| Audio splice-point refinement (RMS energy + zero-crossing snap) | Done |
-| AcousticMap ingest-time analysis (per-word fricative/stop/nasal/vowel fingerprints) | Done |
+| AcousticMap ingest-time analysis (fricative/stop/nasal/vowel fingerprints) | Done |
 | Phoneme-class-aware coda decay (preserves fricative tails like /ʃ/ in "Spanish") | Done |
 | Interior gap speech detection (word-level vs silence-level cut routing) | Done |
-| Bias guard (prevents ZC snap landing inside deleted words) | Done |
 | Cache management UI (transcripts + spectral maps, per-type clear) | Done |
-| AI filler word removal | Done |
-| AI clip creation (Shorts) | Done |
+| AI filler word detection (multilingual, principle-based) | Done |
+| AI clip candidates (multi-duration, batch export, custom save folder) | Done |
+| AI focus modes (redundancy / tighten / key-points / Q&A / topic) | Done |
+| Structured-output AI (OpenAI json_schema, Anthropic tool-use, Ollama format) | Done |
 | Ollama + OpenAI + Claude | Done |
 | Word-level captions (SRT/VTT/ASS) | Done |
 | Caption burn-in on export | Done |
@@ -107,7 +131,7 @@ cutscript/
 | Keyboard shortcuts (J/K/L) | Done |
 | Speaker diarization | Done |
 | Virtualized transcript (react-virtuoso) | Done |
-| Encrypted API key storage | Done |
+| Encrypted API key storage (OS keychain) | Done |
 | Project save/load (.cutscript) | Done |
 | AI background removal | Planned |
 
@@ -136,8 +160,9 @@ cutscript/
 | GET | /cache/sizes | Report transcript + spectral cache sizes |
 | POST | /cache/clear/{kind} | Clear `transcripts` or `spectral` cache |
 | POST | /export | Export edited video (stream copy or re-encode) |
-| POST | /ai/filler-removal | Detect filler words via LLM |
-| POST | /ai/create-clip | AI-suggested clips for shorts |
+| POST | /ai/filler-removal | Detect filler words via LLM (multilingual, structured output) |
+| POST | /ai/create-clip | Return ClipPlan (multiple durations, confidence-scored) |
+| POST | /ai/focus | Return FocusPlan (redundancy / tighten / key_points / qa_extract / topic) |
 | GET | /ai/ollama-models | List local Ollama models |
 | POST | /captions | Generate SRT/VTT/ASS captions |
 | POST | /audio/clean | Noise reduction (DeepFilterNet) |
